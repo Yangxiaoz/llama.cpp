@@ -2,13 +2,26 @@
   "version": 4,
   "configurePresets": [
     {
+        "name":  "linux-base",
+        "hidden": true,
+        "generator":   "Unix Makefiles",
+        "binaryDir":   "${sourceDir}/build-${presetName}",
+        "cacheVariables": {
+            "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+            "CMAKE_INSTALL_RPATH": "$ORIGIN;$ORIGIN/..",
+            "CMAKE_BUILD_PARALLEL_LEVEL": "14",
+            "GGML_CCACHE": "ON"
+        }
+    },
+    {
         "name":  "base",
         "hidden": true,
         "generator":   "Ninja",
         "binaryDir":   "${sourceDir}/build-${presetName}",
         "cacheVariables": {
             "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-            "CMAKE_INSTALL_RPATH": "$ORIGIN;$ORIGIN/.."
+            "CMAKE_INSTALL_RPATH": "$ORIGIN;$ORIGIN/..",
+            "CMAKE_BUILD_PARALLEL_LEVEL": "14"
         }
     },
     {
@@ -64,7 +77,7 @@
             "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/cmake/arm64-apple-clang.cmake"
         }
     },
-
+    { "name": "linux-debug", "inherits": [ "linux-base","debug" ] },
     { "name": "arm64-windows-llvm-debug", "inherits": [ "base", "arm64-windows-llvm", "debug" ] },
     { "name": "arm64-windows-llvm-release", "inherits": [ "base", "arm64-windows-llvm", "reldbg" ] },
     { "name": "arm64-windows-llvm+static-release", "inherits": [ "base", "arm64-windows-llvm", "reldbg", "static" ] },

@@ -1,5 +1,20 @@
 # llama.cpp
 
+## sample_data branch
+
+This branch is used to sample data and output it to the log file by modifying: [example/simple_demo](./examples/simple/README.md)
+
+### quick start
+
+1. complie this project
+
+2. select the Select the corresponding macro flag in [simple.cpp](./examples/simple/simple.cpp)
+
+3. edit the log file path in [simple.cpp](./examples/simple/simple.cpp) 
+
+4. run
+
+---
 ![llama](https://user-images.githubusercontent.com/1991296/230134379-7181e485-c521-4d23-a0d6-f7b3b61ba524.png)
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
