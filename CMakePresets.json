@@ -10,7 +10,8 @@
               "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
               "CMAKE_INSTALL_RPATH": "$ORIGIN;$ORIGIN/..",
               "CMAKE_BUILD_PARALLEL_LEVEL": "14",
-              "GGML_CCACHE": "ON"
+              "GGML_CCACHE": "ON",
+              "GGML_CPU_AARCH64": "OFF"
           }
       },
       {
