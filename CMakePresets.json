@@ -11,7 +11,7 @@
               "CMAKE_INSTALL_RPATH": "$ORIGIN;$ORIGIN/..",
               "CMAKE_BUILD_PARALLEL_LEVEL": "14",
               "GGML_CCACHE": "ON",
-              "GGML_CPU_AARCH64": "OFF"
+              "LLAMA_CURL": "OFF"
           }
       },
       {
