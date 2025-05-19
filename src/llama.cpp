@@ -126,6 +126,9 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
         if (!model.load_tensors(ml)) {
             return -2;
         }
+    #ifdef CUSTOM_MOE
+        // init moe_table
+    #endif
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading model: %s\n", __func__, err.what());
         return -1;

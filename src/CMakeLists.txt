@@ -32,6 +32,7 @@ add_library(llama
             llama-quant.cpp
             llama-sampling.cpp
             llama-vocab.cpp
+            custom-moe-offload.cpp
             unicode-data.cpp
             unicode.cpp
             unicode.h
