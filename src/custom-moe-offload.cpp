@@ -24,19 +24,20 @@ private:
 };
 
 
-custom_expert_table::custom_expert_table(int n_expert, int n_moe_layer)
+custom_expert_table::custom_expert_table(int n_moe_layer, int n_expert)
     :  experts(n_moe_layer,std::vector<custom_expert_group>(n_expert)),
        n_row(n_moe_layer),
        n_col(n_expert){}
 
 custom_moe_unified::custom_moe_unified(const llama_model & model,ggml_backend_buffer_type_t buft,float utilization) 
-    : table(hparams.n_layer - hparams.n_layer_dense_lead, hparams.n_expert),
+    : table(model.hparams.n_layer - model.hparams.n_layer_dense_lead, model.hparams.n_expert),
       model(model),
       hparams(model.hparams){
     int32_t n_slots = 0;
     //select up as typical expert
     ggml_tensor * expert = model.layers.back().ffn_up_exps;//select the "up" of last layer as typical expert
-    nbyte_expert = ggml_nbytes(expert) / hparams.n_expert;
+    nbyte_layer_experts = ggml_nbytes(expert);
+    nbyte_expert = nbyte_layer_experts / hparams.n_expert;
     size_t nbyte_expert_group = nbyte_expert * 3; // 3: up、gate、down
     type_expert =  expert->type;
     
@@ -52,6 +53,11 @@ custom_moe_unified::custom_moe_unified(const llama_model & model,ggml_backend_bu
             throw std::runtime_error(format("%s: no CPU backend found", __func__));
         }
     }
+    auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
+    if(!host_buft){
+        host_buft = buft;
+    }
+
     ggml_backend_dev_props props;
     ggml_backend_dev_get_props(dev, &props);
 
@@ -78,6 +84,7 @@ custom_moe_unified::custom_moe_unified(const llama_model & model,ggml_backend_bu
 
     ctxs.emplace_back(ctx);
     
+    //create moe_pool_tensors
     for(int i = 0; i < n_slots; i++){
         struct ffn_expert_group cur;
 
@@ -92,27 +99,20 @@ custom_moe_unified::custom_moe_unified(const llama_model & model,ggml_backend_bu
     }
 
 // allocate tensors and initialize the buffers to avoid NaNs in the padding
-
-    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, host_buft);
     if (!buf) {
         throw std::runtime_error("failed to allocate buffer for moe_pools");
     }
     
 
-{//TBD: need to determine if need
-// indicate that this buffer contains weights
-// this is used by ggml_backend_sched to improve op scheduling: ops that use a weight are preferably scheduled to the backend that contains the weight
-    // ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-}
+    {//TBD: need to determine if need
+    // indicate that this buffer contains weights
+    // this is used by ggml_backend_sched to improve op scheduling: ops that use a weight are preferably scheduled to the backend that contains the weight
+        // ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    }
     LLAMA_LOG_INFO("%s: %10s moe_expert_pool buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
 
-//TBD:need to implement the mlock feature
-    // if (use_mlock && ggml_backend_buffer_is_host(buf)) {
-    // pimpl->mlock_bufs.emplace_back(new llama_mlock);
-    // auto & mlock_buf = pimpl->mlock_bufs.back();
-    // mlock_buf->init   (ggml_backend_buffer_get_base(buf));
-    // mlock_buf->grow_to(ggml_backend_buffer_get_size(buf));
-    // }
+
     bufs.emplace_back(buf);
 
 }
@@ -142,7 +142,9 @@ void custom_moe_unified::clear() {
 }
 
 bool custom_moe_unified::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-
+    GGML_UNUSED(seq_id);
+    GGML_UNUSED(p0);
+    GGML_UNUSED(p1);
     // uint32_t new_head = size;
 
     // if (p0 < 0) {
@@ -186,6 +188,10 @@ bool custom_moe_unified::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1)
 }
 
 void custom_moe_unified::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    GGML_UNUSED(seq_id_src);
+    GGML_UNUSED(seq_id_dst);
+    GGML_UNUSED(p0);
+    GGML_UNUSED(p1);
     // if (seq_id_src == seq_id_dst) {
     //     return;
     // }
@@ -209,6 +215,7 @@ void custom_moe_unified::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst
 }
 
 void custom_moe_unified::seq_keep(llama_seq_id seq_id) {
+    GGML_UNUSED(seq_id);
     // uint32_t new_head = size;
 
     // for (uint32_t i = 0; i < size; ++i) {
@@ -236,6 +243,10 @@ void custom_moe_unified::seq_keep(llama_seq_id seq_id) {
 }
 
 void custom_moe_unified::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) {
+    GGML_UNUSED(seq_id);
+    GGML_UNUSED(p0);
+    GGML_UNUSED(p1);
+    GGML_UNUSED(delta);
     // if (delta == 0) {
     //     return;
     // }
@@ -280,6 +291,10 @@ void custom_moe_unified::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1
 }
 
 void custom_moe_unified::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    GGML_UNUSED(seq_id);
+    GGML_UNUSED(p0);
+    GGML_UNUSED(p1);
+    GGML_UNUSED(d);
     // if (d == 1) {
     //     return;
     // }
@@ -311,6 +326,8 @@ void custom_moe_unified::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1
 }
 
 llama_pos custom_moe_unified::seq_pos_max(llama_seq_id seq_id) const {
+    GGML_UNUSED(seq_id);
+
     llama_pos result = 0;
 
     // for (uint32_t i = 0; i < size; ++i) {

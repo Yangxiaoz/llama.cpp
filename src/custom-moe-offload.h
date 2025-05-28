@@ -35,15 +35,17 @@ struct custom_tensor_mmap{
 using tensor_mmap_entry = std::pair<expert_state, custom_tensor_mmap>;
 
 struct custom_expert_group{
-    tensor_mmap_entry up;
-    tensor_mmap_entry gate;
-    tensor_mmap_entry down;
+    struct custom_tensor_mmap up;
+    struct custom_tensor_mmap gate;
+    struct custom_tensor_mmap down;
+    expert_state state;
+    int pool_id;
 };
 
 class custom_expert_table{
 public:
 
-    custom_expert_table(int n_expert, int n_moe_layer);
+    custom_expert_table(int n_moe_layer, int n_expert);
 
     //members
     std::vector<std::vector<custom_expert_group>> experts;
@@ -59,7 +61,7 @@ private:
     int n_col;
 
     void check_indices(int row, int col) const {
-        GGML_ASSERT((row < n_row)&& (col < n_row) && "expert_table index out of bounds");
+        GGML_ASSERT((row < n_row)&& (col < n_col) && "expert_table index out of bounds");
     }
 };
 
@@ -78,6 +80,7 @@ public:
     
     ggml_type                               type_expert;
     size_t                                  nbyte_expert;
+    size_t                                  nbyte_layer_experts;
     //global expert table
     class custom_expert_table               table;
     //available expert pool
@@ -108,5 +111,8 @@ private:
     //func
     //TBD
     size_t total_size() const;
+
+    void prefill_load_init();
+    
     llm_graph_result_ptr build_moe_predic();
 };

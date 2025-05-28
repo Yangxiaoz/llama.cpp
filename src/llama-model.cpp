@@ -1567,6 +1567,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     };
 
 #ifdef CUSTOM_MOE
+    //TBD: the moe_ctx seemly no used
     int n_expert_layer = hparams.n_layer - hparams.n_layer_dense_lead;
     const size_t moe_ctx_size = n_expert_layer * 3 * ggml_tensor_overhead();
     std::map<ggml_backend_buffer_type_t, ggml_context *> moe_ctx_map;
@@ -13351,20 +13352,19 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
             const auto * weight_gates = ml.get_weight(ggml_get_name(gates));
             const auto * weight_downs = ml.get_weight(ggml_get_name(downs));
             // weight_ups->offs;
-            expert_state initial_state = expert_state::InMemory;
+            expert_state initial_state = expert_state::OnDisk;
             size_t nbyte_expert = moe_pool->nbyte_expert;
             for(uint32_t j = 0; j < n_col; j++){
-                table.at(i,j).up.first        = initial_state;
-                table.at(i,j).up.second.idx   = weight_ups->idx; 
-                table.at(i,j).up.second.offs  = weight_ups->offs + j* nbyte_expert;
+                table.at(i,j).state    = initial_state;
 
-                table.at(i,j).gate.first      = initial_state;
-                table.at(i,j).gate.second.idx = weight_gates->idx;
-                table.at(i,j).gate.second.offs= weight_gates->offs +j* nbyte_expert;
+                table.at(i,j).up.idx   = weight_ups->idx; 
+                table.at(i,j).up.offs  = weight_ups->offs + j* nbyte_expert;
 
-                table.at(i,j).down.first      = initial_state;
-                table.at(i,j).down.second.idx = weight_downs->idx;
-                table.at(i,j).down.second.offs= weight_downs->offs +j* nbyte_expert;
+                table.at(i,j).gate.idx = weight_gates->idx;
+                table.at(i,j).gate.offs= weight_gates->offs +j* nbyte_expert;
+
+                table.at(i,j).down.idx = weight_downs->idx;
+                table.at(i,j).down.offs= weight_downs->offs +j* nbyte_expert;
             }
         }
         
