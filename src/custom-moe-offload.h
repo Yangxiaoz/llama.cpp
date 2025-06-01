@@ -11,12 +11,18 @@
 #include <set>
 #include <vector>
 
+#define M_PAD(x, n) (((x) + (n) - 1) & ~((n) - 1))
+#ifndef NDEBUG
+    #define  CUSTOM_ASSERT(x)  GGML_ASSERT(x)
+#else
+    #define  CUSTOM_ASSERT(x)  ((void)(x))
+#endif
 struct llama_hparams;
 struct llama_model;
 struct llama_context;
 
 
-struct ffn_expert_group{
+struct ffn_expert_pool{
     struct ggml_tensor * up;
     struct ggml_tensor * gate;
     struct ggml_tensor * down;
@@ -39,7 +45,7 @@ struct custom_expert_group{
     struct custom_tensor_mmap gate;
     struct custom_tensor_mmap down;
     expert_state state;
-    int pool_id;
+    llama_pos pos;
 };
 
 class custom_expert_table{
@@ -48,61 +54,75 @@ public:
     custom_expert_table(int n_moe_layer, int n_expert);
 
     //members
-    std::vector<std::vector<custom_expert_group>> experts;
     llama_files files;
+    std::vector<std::vector<custom_expert_group>> experts;
 
     // func
     custom_expert_group& at(int row, int col){
         check_indices(row,col);
+
         return experts[row][col];
     }
+
+    llama_pos get_pos(int row, int col){
+        check_indices(row,col);
+        return experts[row][col].pos; 
+    }
+
+    void set_pos(int row, int col, llama_pos id){
+        check_indices(row,col);
+        experts[row][col].pos = id;
+    }
+
+
 private:
     int n_row;
     int n_col;
-
+    //func:
     void check_indices(int row, int col) const {
         GGML_ASSERT((row < n_row)&& (col < n_col) && "expert_table index out of bounds");
     }
 };
 
 
-// struct custom_moe_pool: public llama_memory_i{
-// //TBD:...
-
-// };
-
-
-class custom_moe_unified: public llama_memory_i{
+class custom_moe_unified{
 public:
-    custom_moe_unified(const llama_model & model,ggml_backend_buffer_type_t buft,float utilization);
-
+    custom_moe_unified(const llama_model & model,float utilization,const std::string & fname,llama_model_loader & ml);
     ~custom_moe_unified() = default;
     
     ggml_type                               type_expert;
-    size_t                                  nbyte_expert;
-    size_t                                  nbyte_layer_experts;
-    //global expert table
-    class custom_expert_table               table;
-    //available expert pool
-    std::vector<struct ffn_expert_group>    groups;
+    uint32_t                                nbyte_expert;
+    class custom_expert_table               table;       //global expert table
 
-    //////////////////////
-    //llama_memory_i
-    //TBD:
-    void clear() override;
-    bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
-    void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
-    void seq_keep(llama_seq_id seq_id) override;
-    void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos delta) override;
-    void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
-    llama_pos seq_pos_max(llama_seq_id seq_id) const override;
-    virtual bool get_can_edit() const override;
-    ///////////////////
+//func:
+    //
+    // custom_moe_unified  API
+    //
+    uint32_t total_size() const;
+
+    void init_full();
+    void init_prefill();
+
+    void expert_check();
+    void expert_fetch();
+    void sync();
+    // void defrag_sched();
+
+    //
+    // graph_build API
+    //  
+    ggml_tensor * get_up() const;
+    ggml_tensor * get_gate() const;
+    ggml_tensor * get_down() const;
+
     
 private:
     const llama_model                       &model;
     const llama_hparams                     &hparams;
 
+    //available expert pool
+    // custom_moe_cells_unified                cells;
+    std::vector<struct ffn_expert_pool>     pools;       
 
     // ctxs_bufs for pool
     std::vector<ggml_context_ptr>           ctxs;
@@ -110,9 +130,39 @@ private:
 
     //func
     //TBD
-    size_t total_size() const;
+    void table_init(const llama_model & model,const std::string & fname,llama_model_loader & ml);
+    uint32_t get_padding() const;
 
-    void prefill_load_init();
-    
-    llm_graph_result_ptr build_moe_predic();
+    // llm_graph_result_ptr build_moe_predic();
 };
+
+
+// class custom_moe_cells_unified {
+// public:
+//     void reset(){
+//         for (uint32_t i = 0; i < pos.size(); ++i) {
+//             pos[i]   = -1;
+//             shift[i] =  0;
+//         }
+
+//         used.clear();
+//     }
+
+//     uint32_t size() const {
+//         return 0;
+//     }
+
+//     void resize(uint32_t n) {
+//         pos.resize(n);
+//         shift.resize(n);
+
+//         reset();
+//     }
+
+// private:
+//     std::set<uint32_t> used;
+
+//     std::vector<llama_pos> pos;
+
+//     std::vector<llama_pos> shift;
+// };
