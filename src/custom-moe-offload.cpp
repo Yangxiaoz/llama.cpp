@@ -56,19 +56,18 @@ void custom_moe_unified::table_init(const llama_model & model,const std::string 
         const auto * weight_downs = ml.get_weight(ggml_get_name(downs));
         // weight_ups->offs;
         expert_state initial_state = expert_state::OnDisk;
-        size_t nbyte_expert = this->nbyte_expert;
         for(uint32_t j = 0; j < n_col; j++){
             table.at(i,j).state    = initial_state;
             table.at(i,j).pos      = -1;
 
             table.at(i,j).up.idx   = weight_ups->idx; 
-            table.at(i,j).up.offs  = weight_ups->offs + j* nbyte_expert;
+            table.at(i,j).up.offs  = weight_ups->offs + j*  nbyte_up_gate;
 
             table.at(i,j).gate.idx = weight_gates->idx;
-            table.at(i,j).gate.offs= weight_gates->offs +j* nbyte_expert;
+            table.at(i,j).gate.offs= weight_gates->offs +j* nbyte_up_gate;
 
             table.at(i,j).down.idx = weight_downs->idx;
-            table.at(i,j).down.offs= weight_downs->offs +j* nbyte_expert;
+            table.at(i,j).down.offs= weight_downs->offs +j* nbyte_down;
         }
     }
     
@@ -79,11 +78,20 @@ custom_moe_unified::custom_moe_unified(const llama_model & model,float utilizati
     : table(model.hparams.n_layer - model.hparams.n_layer_dense_lead, model.hparams.n_expert),
       model(model),
       hparams(model.hparams){
-    //select up as typical expert
-    ggml_tensor * classic_expert = model.layers.back().ffn_up_exps;//select the "up" of last layer as typical expert
 
-    this->nbyte_expert = ggml_nbytes(classic_expert) / hparams.n_expert;
-    this->type_expert = classic_expert->type;
+    uint16_t n_expert = hparams.n_expert;
+    //select up as typical expert
+    ggml_tensor * classic_up_gate = model.layers.back().ffn_up_exps;                 //select the "up" of last layer as typical expert
+    GGML_ASSERT(classic_up_gate->type == model.layers.back().ffn_gate_exps->type);   //assert the gate is equal to up
+    ggml_tensor * classic_down = model.layers.back().ffn_down_exps;             //select the "down" of last layer as typical expert
+
+    this->type_up_gate  = classic_up_gate->type;
+    this->type_down     = classic_down->type;  
+
+    this->nbyte_up_gate = ggml_nbytes(classic_up_gate)   / n_expert;
+    this->nbyte_down    = ggml_nbytes(classic_down) / n_expert;
+
+    this->nbyte_group   = nbyte_up_gate * 2 + nbyte_down; //up、gate、down
 
     //init the table
     table_init(model,fname,ml);
@@ -109,11 +117,7 @@ custom_moe_unified::custom_moe_unified(const llama_model & model,float utilizati
     ggml_backend_dev_get_props(dev, &props);
 
     uint64_t n_byte_availa = (uint64_t)(utilization * props.memory_total);
-    // const auto padding = get_padding();
-
-    uint32_t n_byte_grpup = nbyte_expert * 3;// 3: up、gate、down
-    int32_t n_slots = 0;
-    n_slots  = n_byte_availa / n_byte_grpup;
+    this->n_slots  = n_byte_availa / nbyte_group;
     // uint64_t n_size = M_PAD((n_byte_availa/3),padding);
 
     // cells.resize(n_slots);
@@ -136,9 +140,13 @@ custom_moe_unified::custom_moe_unified(const llama_model & model,float utilizati
     ggml_tensor * up;
     ggml_tensor * gate;
     ggml_tensor * down;
-    up = ggml_new_tensor_3d(ctx, type_expert, classic_expert->ne[0], classic_expert->ne[1],n_slots);
-    gate = ggml_new_tensor_3d(ctx, type_expert, classic_expert->ne[0],classic_expert->ne[1],n_slots);
-    down = ggml_new_tensor_3d(ctx, type_expert, classic_expert->ne[0],classic_expert->ne[1],n_slots);
+    //memory alignment assert
+    const auto n_pad = get_padding();
+    GGML_ASSERT(classic_up_gate->nb[2] % n_pad == 0);
+    GGML_ASSERT(classic_down->nb[2] % n_pad == 0);
+    up = ggml_new_tensor_3d(ctx, type_up_gate, classic_up_gate->ne[0], classic_up_gate->ne[1],n_slots);
+    gate = ggml_new_tensor_3d(ctx, type_up_gate, classic_up_gate->ne[0],classic_up_gate->ne[1],n_slots);
+    down = ggml_new_tensor_3d(ctx, type_down, classic_down->ne[0],classic_down->ne[1],n_slots);
     ggml_format_name(up,   "pool_ups");
     ggml_format_name(gate, "pool_gate");
     ggml_format_name(down, "pool_downs");

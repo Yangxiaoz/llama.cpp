@@ -90,8 +90,14 @@ public:
     custom_moe_unified(const llama_model & model,float utilization,const std::string & fname,llama_model_loader & ml);
     ~custom_moe_unified() = default;
     
-    ggml_type                               type_expert;
-    uint32_t                                nbyte_expert;
+
+    ggml_type                               type_up_gate;
+    ggml_type                               type_down;
+
+    uint32_t                                nbyte_up_gate;
+    uint32_t                                nbyte_down;
+    uint32_t                                nbyte_group;
+    uint32_t                                n_slots;
     class custom_expert_table               table;       //global expert table
 
 //func:

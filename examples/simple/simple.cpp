@@ -82,7 +82,7 @@ int main(int argc, char ** argv) {
 
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = ngl;
-    // model_params.use_mmap = false;
+    model_params.use_mmap = false;// mmap will map all file or weight
 
     llama_model * model = llama_model_load_from_file(model_path.c_str(), model_params);
 

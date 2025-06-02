@@ -1570,16 +1570,16 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     //TBD: the moe_ctx seemly no used
     int n_expert_layer = hparams.n_layer - hparams.n_layer_dense_lead;
     const size_t moe_ctx_size = n_expert_layer * 3 * ggml_tensor_overhead();
-    ggml_context * moe_ctx_temp = nullptr;
+    ggml_context * moe_table_ctx = nullptr;
     {
         ggml_init_params params = {
             /*.mem_size   =*/ moe_ctx_size,
             /*.mem_buffer =*/ NULL,
             /*.no_alloc   =*/ true,
         };
-        moe_ctx_temp = ggml_init(params);
+        moe_table_ctx = ggml_init(params);
 
-        if (!moe_ctx_temp) {
+        if (!moe_table_ctx) {
             throw std::runtime_error(format("failed to create ggml context"));
         }
     }
@@ -1738,7 +1738,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             #ifdef CUSTOM_MOE
                 ggml_context * ctx = nullptr;
                 if(flags & TENSOR_EXPERT_WEIGHT){//use moe_ctx
-                    ctx = moe_ctx_temp;
+                    ctx = moe_table_ctx;
                 }
                 else{//defualt
                     ctx = ctx_for_buft(buft);
@@ -4171,7 +4171,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
     ml.done_getting_tensors();
 #ifdef CUSTOM_MOE
-    ggml_free(moe_ctx_temp);
+    table_ctx.reset(moe_table_ctx);
 #endif
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());

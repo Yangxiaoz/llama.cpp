@@ -355,6 +355,7 @@ struct llama_model {
 
     std::vector<llama_layer> layers;
 #ifdef CUSTOM_MOE
+    ggml_context_ptr         table_ctx;
     std::unique_ptr<custom_moe_unified> moe_unified;
 #endif
     llama_model_params params;
