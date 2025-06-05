@@ -130,8 +130,8 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
         // init moe_table
         float utilization = params.moe_memory_utilization;
         GGML_ASSERT(utilization >0 && utilization<1);
-
         model.moe_unified.reset(new custom_moe_unified(model,utilization,fname,ml));
+        model.moe_unified.get()->prefill_init();
     #endif
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading model: %s\n", __func__, err.what());
