@@ -8,8 +8,11 @@
 #include <cmath>
 #include <limits>
 #include <map>
+#include <random>
 #include <mutex>
+#include <atomic>
 #include <stdexcept>
+#include <condition_variable>
 
 
 class custom_io_read{
@@ -192,9 +195,6 @@ void custom_moe_unified::table_init(const llama_model & model,const std::string 
             down_type
         };
         expert_state initial_state = expert_state::OnDisk;
-        size_t a = type_for_size(up_type);
-        size_t b = type_for_size(down_type);
-        printf("%ld  %ld  \n",a,b);
         for(uint32_t j = 0; j < n_col; j++){
             table.at(i,j).state    = initial_state;
             table.at(i,j).pos      = -1;
@@ -239,6 +239,10 @@ void custom_moe_unified::check_layer(uint32_t il){
 void custom_moe_unified::check_expert(uint32_t il,uint32_t id){
     if(table.at(il,id).state == expert_state::OnDisk){
         llama_pos pos = pool_alloc(1);
+        //TBD: Need to be replaced with scheduling logic
+        if(pos == -1){
+            //TBD
+        }  
         load_expert(il,id,pos);
     }
 }
@@ -424,14 +428,46 @@ uint32_t custom_moe_unified::get_padding() const {
 //custom op_kernel
 //
 
+/*
+multi-thread
+*/
+class CallSync {
+public:
+    std::atomic<int> count{0};
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool init_done = false;
+    
+    void wait_initialization(std::function<void()> init_fn) {
+        std::unique_lock<std::mutex> lock(mtx);
+        if (!init_done) {
+            //initial
+            init_fn();
+            init_done = true;
+            cv.notify_all();
+        }
+        cv.wait(lock, [&]{ return init_done == true; });
+    }
+    
+    void mark_completion(int nth) {
+        int current = count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (current == nth) {
+            std::unique_lock<std::mutex> lock(mtx);
+            // reset
+            init_done = false;
+            count.store(0, std::memory_order_relaxed);
+        }
+    }
+};
+
 // mapping the select_id to pos of pool
 void id_pos_map(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth,  void * userdata){
     GGML_ASSERT(userdata != nullptr);
     GGML_ASSERT(ggml_are_same_shape(dst, a));
     GGML_ASSERT(a->ne[2] == a->ne[3]);
     GGML_ASSERT(a->ne[2] == 1);
+
     bool prefill = (a->ne[1] > 1);
-    static std::once_flag init_flag;
     const int32_t       * a_data        = (int32_t *)ggml_get_data(a);
     int32_t             * dst_data      = (int32_t *)ggml_get_data(dst);
     custom_moe_unified  * moe_unified   = (custom_moe_unified *)userdata;
@@ -441,22 +477,18 @@ void id_pos_map(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith
     auto it = moe_unified->name_layer_map.find(a_name);
     GGML_ASSERT(it != moe_unified->name_layer_map.end());
     uint32_t il = it->second;
-
-    //thread safety
-    std::call_once(init_flag, [moe_unified,il,prefill]() {
-        if(prefill){
-            moe_unified->check_layer(il);
-        }
+    //wait to check layer state when prefill
+    static CallSync sync;
+    sync.wait_initialization([&]{
+        if(prefill)moe_unified->check_layer(il);
     });
-    
+
     int n_ids   = a->ne[0];
     int n_token = a->ne[1];
     if(prefill){// parallel
         const int dr = (n_token + nth - 1) / nth;
         const int ie0 = dr * ith;
         const int ie1 = MIN(ie0 + dr, n_token);
-        //check layer_state
-        //TBD: bug!!parallel Conflicting Access
         //mapping
         for(int i = ie0; i < ie1; i++){
             for(int j = 0; j < n_ids; j++){
@@ -464,6 +496,7 @@ void id_pos_map(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith
                 dst_data[i*(dst->nb[1] / 4) +j] = moe_unified->id_map(il,a_data[i*(a->nb[1] / 4) + j]);
             }
         }
+        sync.mark_completion(nth);
     } else{// no parallel
         if(ith == 0){
             for(int i = 0; i < n_ids; i++){
@@ -474,5 +507,5 @@ void id_pos_map(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith
             }
         }
     }
-
+    
 }
