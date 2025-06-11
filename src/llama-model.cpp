@@ -3389,6 +3389,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, TENSOR_EXPERT_WEIGHT);
                             layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, TENSOR_EXPERT_WEIGHT);
 
+                            printf("moe:: the %d layer gate down up: %d %d %d \n",i,layer.ffn_gate_exps->type,layer.ffn_down_exps->type,layer.ffn_up_exps->type);
+
                         #else
                             layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
                             layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
@@ -10517,6 +10519,18 @@ struct llm_build_deepseek2 : public llm_graph_context {
                 cb(cur, "ffn_out", il);
             } else {
                 // MoE branch
+            #ifdef CUSTOM_MOE
+                ggml_tensor * moe_out =
+                    build_moe_ffn_offload(gf,cur,
+                            model.layers[il].ffn_gate_inp,
+                            model.layers[il].ffn_exp_probs_b,
+                            model.moe_unified.get(),
+                            n_expert, n_expert_used,
+                            LLM_FFN_SILU, hparams.expert_weights_norm,
+                            true, hparams.expert_weights_scale,
+                            (llama_expert_gating_func_type) hparams.expert_gating_func,
+                            il);
+            #else
                 ggml_tensor * moe_out =
                     build_moe_ffn(cur,
                             model.layers[il].ffn_gate_inp,
@@ -10529,6 +10543,7 @@ struct llm_build_deepseek2 : public llm_graph_context {
                             true, hparams.expert_weights_scale,
                             (llama_expert_gating_func_type) hparams.expert_gating_func,
                             il);
+            #endif
                 cb(moe_out, "ffn_moe_out", il);
 
                 // FFN shared expert
