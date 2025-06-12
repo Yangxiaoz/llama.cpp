@@ -46,8 +46,8 @@ custom_moe_unified::custom_moe_unified(const llama_model & model,float utilizati
     ggml_tensor * classic_down = model.layers.back().ffn_down_exps;             
 
     GGML_ASSERT(classic_up->type == classic_gate->type);   //assert the gate is equal to up
-    this->ne[0] = classic_up->ne[0];
-    this->ne[1] = classic_up->ne[1];
+    this->expert_ne[0] = classic_up->ne[0];
+    this->expert_ne[1] = classic_up->ne[1];
     this->pool_type = {
         classic_up->type,
         classic_gate->type,
@@ -150,68 +150,6 @@ uint32_t custom_moe_unified::total_size() const {
     return size;
 }
 
-void custom_moe_unified::table_init(const llama_model & model,const std::string & fname,llama_model_loader & ml){
-
-    custom_expert_table & table = this->table;
-
-    // Checking the dims of a two-dimensional table
-    uint32_t n_row = table.experts.size();       //n_moe_layers
-    uint32_t n_col = table.experts[0].size();    //n_experts
-    uint32_t n_layer = hparams.n_layer;
-    uint32_t n_dense = hparams.n_layer_dense_lead;
-    GGML_ASSERT(n_row == (n_layer - n_dense));
-    GGML_ASSERT(n_col == hparams.n_expert);
-    //init files
-    table.files.emplace_back(new llama_file(fname.c_str(), "rb"));
-
-    std::map<ggml_type,size_t> type_map;
-    auto type_for_size = [&](ggml_type type) -> size_t {
-        auto it = type_map.find(type);
-        if (it == type_map.end()) {
-            size_t nbyte =(ne[0] * ne[1])* ggml_type_size(type) / ggml_blck_size(type);
-            type_map[type] = nbyte;
-            return nbyte;
-        }
-        return it->second;
-    };
-
-    for(uint32_t i = 0; i < n_row; i++){
-
-        ggml_tensor * ups   =  model.layers.at(i + n_dense).ffn_up_exps;
-        ggml_tensor * gates =  model.layers.at(i + n_dense).ffn_gate_exps;
-        ggml_tensor * downs =  model.layers.at(i + n_dense).ffn_down_exps;
-
-        const auto * weight_ups = ml.get_weight(ggml_get_name(ups));
-        const auto * weight_gates = ml.get_weight(ggml_get_name(gates));
-        const auto * weight_downs = ml.get_weight(ggml_get_name(downs));
-        GGML_ASSERT(weight_ups->tensor->type = weight_gates->tensor->type);
-
-        ggml_type up_type = weight_ups->tensor->type;
-        ggml_type gate_type = weight_gates->tensor->type;
-        ggml_type down_type = weight_downs->tensor->type;
-        table.layer_type[i] = {
-            up_type,
-            gate_type,
-            down_type
-        };
-        expert_state initial_state = expert_state::OnDisk;
-        for(uint32_t j = 0; j < n_col; j++){
-            table.at(i,j).state    = initial_state;
-            table.at(i,j).pos      = -1;
-
-            table.at(i,j).up.idx   = weight_ups->idx; 
-            table.at(i,j).up.offs  = weight_ups->offs + j*  type_for_size(up_type);
-
-            table.at(i,j).gate.idx = weight_gates->idx;
-            table.at(i,j).gate.offs= weight_gates->offs +j* type_for_size(gate_type);
-
-            table.at(i,j).down.idx = weight_downs->idx;
-            table.at(i,j).down.offs= weight_downs->offs +j* type_for_size(down_type);
-        }
-    }   
-}
-
-
 void custom_moe_unified::prefill_init(){
     uint32_t n_slot_layer =  hparams.n_expert;
     uint32_t n_layer_load =  pool.n_slots / n_slot_layer;
@@ -246,6 +184,7 @@ void custom_moe_unified::check_expert(uint32_t il,uint32_t id){
         load_expert(il,id,pos);
     }
 }
+//mapping the select_id to pos of pool
 llama_pos custom_moe_unified::id_map(uint32_t il,  int32_t selec_id){
     return table.at(il,selec_id).pos;
 }
@@ -291,59 +230,72 @@ ggml_tensor * custom_moe_unified::get_downs(struct ggml_context * ctx, uint32_t 
         return res;
     }
 }
-/* 
-input: 
-    n: num of slots  
-return:
-    pos of alloc in pool
-    pos == -1:  alloc failed
-*/
-llama_pos custom_moe_unified::pool_alloc(int32_t n){
-    if(n <= 0)              return -1;
-    if(n > pool.n_slots)   return -1;
-    auto& free_slots = pool.free_slots;
-    for(auto it = free_slots.begin(); it != free_slots.end(); it++){
-        llama_pos cur_pos   = it->first;
-        int32_t    length    = it->second;
-        if (n <= length){
-            free_slots.erase(it);
-            if(n < length){
-                //insert a new slot_map
-                free_slots[cur_pos + n] = length - n;
-            }                    
-            return cur_pos;
-        }
-    }
-    return -1;
 
+void custom_moe_unified::table_init(const llama_model & model,const std::string & fname,llama_model_loader & ml){
+
+    custom_expert_table & table = this->table;
+
+    // Checking the dims of a two-dimensional table
+    uint32_t n_row = table.experts.size();       //n_moe_layers
+    uint32_t n_col = table.experts[0].size();    //n_experts
+    uint32_t n_layer = hparams.n_layer;
+    uint32_t n_dense = hparams.n_layer_dense_lead;
+    GGML_ASSERT(n_row == (n_layer - n_dense));
+    GGML_ASSERT(n_col == hparams.n_expert);
+    //init files
+    table.files.emplace_back(new llama_file(fname.c_str(), "rb"));
+
+    std::map<ggml_type,size_t> type_map;
+    auto type_for_size = [&](ggml_type type) -> size_t {
+        auto it = type_map.find(type);
+        if (it == type_map.end()) {
+            size_t nbyte =(expert_ne[0] * expert_ne[1])* ggml_type_size(type) / ggml_blck_size(type);
+            type_map[type] = nbyte;
+            return nbyte;
+        }
+        return it->second;
+    };
+
+    for(uint32_t i = 0; i < n_row; i++){
+
+        ggml_tensor * ups   =  model.layers.at(i + n_dense).ffn_up_exps;
+        ggml_tensor * gates =  model.layers.at(i + n_dense).ffn_gate_exps;
+        ggml_tensor * downs =  model.layers.at(i + n_dense).ffn_down_exps;
+
+        const auto * weight_ups = ml.get_weight(ggml_get_name(ups));
+        const auto * weight_gates = ml.get_weight(ggml_get_name(gates));
+        const auto * weight_downs = ml.get_weight(ggml_get_name(downs));
+        GGML_ASSERT(weight_ups->tensor->type = weight_gates->tensor->type);
+
+        ggml_type up_type = weight_ups->tensor->type;
+        ggml_type gate_type = weight_gates->tensor->type;
+        ggml_type down_type = weight_downs->tensor->type;
+        table.layer_type[i] = {
+            up_type,
+            gate_type,
+            down_type
+        };
+        expert_state initial_state = expert_state::OnDisk;
+        for(uint32_t j = 0; j < n_col; j++){
+            table.at(i,j).state    = initial_state;
+            table.at(i,j).pos      = -1;
+
+            table.at(i,j).up.idx   = weight_ups->idx; 
+            table.at(i,j).up.offs  = weight_ups->offs + j*  type_for_size(up_type);
+
+            table.at(i,j).gate.idx = weight_gates->idx;
+            table.at(i,j).gate.offs= weight_gates->offs +j* type_for_size(gate_type);
+
+            table.at(i,j).down.idx = weight_downs->idx;
+            table.at(i,j).down.offs= weight_downs->offs +j* type_for_size(down_type);
+        }
+    }   
 }
 
-void custom_moe_unified::pool_free(llama_pos pos, int32_t n){
-    if(n <= 0) return;
-    if(pos < 0 || ((pos + n - 1) > pool.n_slots))return;
-    auto& free_slots = pool.free_slots;
-
-    auto next = free_slots.upper_bound(pos);
-    auto prev = (next != free_slots.begin()) ? std::prev(next) : free_slots.end();
-
-    bool merged = false;
-    if(prev != free_slots.end() && (prev->first + prev->second == pos)){
-        prev->second += n;
-        merged = true;
-    }
-    if((next != free_slots.end()) && (pos + n == next->first)){
-        if(merged){
-            prev->second += next->second;
-        } else{
-            free_slots[pos] = n + next->second;
-        }
-        free_slots.erase(next);    
-    } else if (!merged){
-        free_slots[pos] = n;
-    }
-    
+uint32_t custom_moe_unified::get_padding() const {
+    //TODO: check the padding Platform porting compatibility
+    return 32u;
 }
-
 
 void custom_moe_unified::load_data(llama_pos offset,uint32_t row, uint32_t col){
     std::vector<no_init<uint8_t>> read_buf;
@@ -420,9 +372,58 @@ void custom_moe_unified::load_layer(uint32_t il, llama_pos target_pos){
     table.mark_layer(il,expert_state::InMemory,target_pos);
 
 }
-uint32_t custom_moe_unified::get_padding() const {
-    //TODO: check the padding Platform porting compatibility
-    return 32u;
+
+/* 
+input: 
+    n: num of slots  
+return:
+    pos of alloc in pool
+    pos == -1:  alloc failed
+*/
+llama_pos custom_moe_unified::pool_alloc(int32_t n){
+    if(n <= 0)              return -1;
+    if(n > pool.n_slots)   return -1;
+    auto& free_slots = pool.free_slots;
+    for(auto it = free_slots.begin(); it != free_slots.end(); it++){
+        llama_pos cur_pos   = it->first;
+        int32_t    length    = it->second;
+        if (n <= length){
+            free_slots.erase(it);
+            if(n < length){
+                //insert a new slot_map
+                free_slots[cur_pos + n] = length - n;
+            }                    
+            return cur_pos;
+        }
+    }
+    return -1;
+
+}
+
+void custom_moe_unified::pool_free(llama_pos pos, int32_t n){
+    if(n <= 0) return;
+    if(pos < 0 || ((pos + n - 1) > pool.n_slots))return;
+    auto& free_slots = pool.free_slots;
+
+    auto next = free_slots.upper_bound(pos);
+    auto prev = (next != free_slots.begin()) ? std::prev(next) : free_slots.end();
+
+    bool merged = false;
+    if(prev != free_slots.end() && (prev->first + prev->second == pos)){
+        prev->second += n;
+        merged = true;
+    }
+    if((next != free_slots.end()) && (pos + n == next->first)){
+        if(merged){
+            prev->second += next->second;
+        } else{
+            free_slots[pos] = n + next->second;
+        }
+        free_slots.erase(next);    
+    } else if (!merged){
+        free_slots[pos] = n;
+    }
+    
 }
 //
 //custom op_kernel

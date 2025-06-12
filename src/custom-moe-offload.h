@@ -29,19 +29,16 @@ struct llama_hparams;
 struct llama_model;
 struct llama_context;
 
-
 enum expert_state{
     OnDisk,
     InMemory
 };
-
 struct custom_tensor_mmap{
     uint16_t idx;
     size_t offs;
 };
 
 using tensor_mmap_entry = std::pair<expert_state, custom_tensor_mmap>;
-
 struct custom_expert_group{
     struct custom_tensor_mmap up;
     struct custom_tensor_mmap gate;
@@ -114,27 +111,19 @@ class custom_moe_unified{
 public:
     custom_moe_unified(const llama_model & model,float utilization,const std::string & fname,llama_model_loader & ml);
     ~custom_moe_unified() = default;
-
-    int                                         ne[2];
-    uint32_t                                    nbyte_slot_up;
-    uint32_t                                    nbyte_slot_gate;
-    uint32_t                                    nbyte_slot_down;
-    uint32_t                                    n_slots_layer;    // number of slots in one layer
+    //menbers
     std::unordered_map<std::string,uint32_t>    name_layer_map;   //mapping when runtime
-
-//func:
     //
     // custom_moe_unified  API
     //
-    uint32_t                                total_size() const;
-    void                                    prefill_init();
-    void                                    check_layer(uint32_t il);
-    void                                    check_expert(uint32_t il,uint32_t id);
-    llama_pos                               id_map(uint32_t il, int32_t selec_id);
-    //struct ggml_context * ctx
-    ggml_tensor *                           get_ups(struct ggml_context * ctx, uint32_t il) const;
-    ggml_tensor *                           get_gates(struct ggml_context * ctx, uint32_t il) const;
-    ggml_tensor *                           get_downs(struct ggml_context * ctx, uint32_t il) const;    
+    uint32_t                            total_size() const;
+    void                                prefill_init();
+    void                                check_layer(uint32_t il);
+    void                                check_expert(uint32_t il,uint32_t id);
+    llama_pos                           id_map(uint32_t il, int32_t selec_id);
+    ggml_tensor *                       get_ups(struct ggml_context * ctx, uint32_t il) const;
+    ggml_tensor *                       get_gates(struct ggml_context * ctx, uint32_t il) const;
+    ggml_tensor *                       get_downs(struct ggml_context * ctx, uint32_t il) const;    
     
 private:
     const llama_model                   &model;
@@ -152,9 +141,14 @@ private:
         ggml_type                       down;
     };
     //menbers
+    uint32_t                            expert_ne[2];
+    uint32_t                            nbyte_slot_up;
+    uint32_t                            nbyte_slot_gate;
+    uint32_t                            nbyte_slot_down;
+    uint32_t                            n_slots_layer;    // number of slots in one layer
     struct  custom_pool_type            pool_type;
     struct  custom_expert_pool          pool;       
-    class   custom_expert_table         table;       //global expert table
+    class   custom_expert_table         table;     
     std::vector<ggml_context_ptr>       ctxs;
     std::vector<ggml_backend_buffer_ptr>bufs;
     //
@@ -162,16 +156,14 @@ private:
     //
     void        table_init(const llama_model & model,const std::string & fname,llama_model_loader & ml);
     uint32_t    get_padding() const;
+    void        load_data(llama_pos offset,uint32_t table_row, uint32_t table_col);
+    void        load_expert(uint32_t il, uint32_t id,llama_pos target_pos);
+    void        load_layer(uint32_t il, llama_pos target_pos);
     //
     // pool API
     // 
     llama_pos   pool_alloc(int32_t n);
     void        pool_free(llama_pos pos, int32_t n);
-
-    void        load_data(llama_pos offset,uint32_t table_row, uint32_t table_col);
-    void        load_expert(uint32_t il, uint32_t id,llama_pos target_pos);
-    void        load_layer(uint32_t il, llama_pos target_pos);
-    
 };
 
 
