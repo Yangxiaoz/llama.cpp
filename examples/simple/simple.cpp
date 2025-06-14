@@ -83,7 +83,7 @@ int main(int argc, char ** argv) {
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = ngl;
 #ifdef CUSTOM_MOE
-    model_params.moe_memory_utilization = (float) 0.1;
+    model_params.moe_memory_utilization = (float) 0.15;
 #endif
     model_params.use_mmap = false;// mmap will map all file or weight
 
@@ -116,8 +116,8 @@ int main(int argc, char ** argv) {
     ctx_params.n_batch = n_prompt;
     // enable performance counters
     ctx_params.no_perf = false;
-    ctx_params.n_threads = 1;
-    ctx_params.n_threads_batch = 1;
+    // ctx_params.n_threads = 1;
+    ctx_params.n_threads_batch = 12;
     llama_context * ctx = llama_init_from_model(model, ctx_params);
 
     if (ctx == NULL) {

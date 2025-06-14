@@ -15,16 +15,6 @@
 #include <condition_variable>
 
 
-class custom_io_read{
-public:
-    custom_io_read(llama_file *f): file(f) {}
-
-    void read_to(void * dst, size_t size) {
-        file->read_raw(dst, size);
-    }
-private:
-    llama_file * file;
-};
 
 custom_expert_table::custom_expert_table(uint32_t n_moe_layer, uint32_t n_expert)
     :  experts(n_moe_layer,std::vector<custom_expert_group>(n_expert)),
@@ -33,12 +23,23 @@ custom_expert_table::custom_expert_table(uint32_t n_moe_layer, uint32_t n_expert
        n_row(n_moe_layer),
        n_col(n_expert){}
 
+custom_expert_manage::custom_expert_manage(custom_expert_table& table,custom_expert_pool& pool):table(table),pool(pool){
+    uint32_t n_row = table.row_size();
+    int32_t n_col = table.col_size();
+    active_set.resize(n_row);
+    //initialize the map 
+    for(uint32_t i = 0; i < n_row; i++){
+        for(int32_t j = 0; j < n_col; j++){
+            ActiveUnit unit{i, j, 0};
+            active_map[i][j] = unit;
+        }
+    }
+}
 
 custom_moe_unified::custom_moe_unified(const llama_model & model,float utilization,const std::string & fname,llama_model_loader & ml) 
     : model(model),
       hparams(model.hparams),
       table(hparams.n_layer - hparams.n_layer_dense_lead, hparams.n_expert){
-
     uint32_t n_expert = hparams.n_expert;
     //select the last layer as typical expert
     ggml_tensor * classic_up = model.layers.back().ffn_up_exps;                 
@@ -139,6 +140,8 @@ custom_moe_unified::custom_moe_unified(const llama_model & model,float utilizati
     LLAMA_LOG_INFO("n_slot of pool is:%d \n",n_slots);
     LLAMA_LOG_INFO("%s: %10s moe_expert_pool buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
 
+    //initialize a blank management instance
+    manage = std::make_unique<custom_expert_manage>(table, pool);
 }
 
 uint32_t custom_moe_unified::total_size() const {
@@ -151,12 +154,13 @@ uint32_t custom_moe_unified::total_size() const {
 }
 
 void custom_moe_unified::prefill_init(){
-    uint32_t n_slot_layer =  hparams.n_expert;
-    uint32_t n_layer_load =  pool.n_slots / n_slot_layer;
+    uint32_t n_layer_load =  pool.n_slots / n_slots_layer;
+    
     for(uint32_t il = 0; il < n_layer_load; il++){
-        llama_pos slot_pos = pool_alloc(n_slot_layer);
+        llama_pos slot_pos = pool_alloc(n_slots_layer);
         load_layer(il,slot_pos);
     }
+    
     LLAMA_LOG_INFO("custom_moe prefill init: %d layers have been pre-load",n_layer_load);
 }
 
@@ -168,7 +172,7 @@ void custom_moe_unified::check_layer(uint32_t il){
         //Reuse the pool of prev_layer for cur_layer
         llama_pos pos = table.at(prev_il,LAYER_HEAD).pos;
         //free the prev_layer in table
-        table.mark_layer(prev_il,expert_state::OnDisk,-1);
+        free_layer(prev_il);
         //load layer to pool
         load_layer(il,pos);
     } 
@@ -177,9 +181,19 @@ void custom_moe_unified::check_layer(uint32_t il){
 void custom_moe_unified::check_expert(uint32_t il,uint32_t id){
     if(table.at(il,id).state == expert_state::OnDisk){
         llama_pos pos = pool_alloc(1);
-        //TBD: Need to be replaced with scheduling logic
         if(pos == -1){
-            //TBD
+            auto management = manage.get();
+            int tar_il;
+            if(il == 0){
+                tar_il = (hparams.n_layer -hparams.n_layer_dense_lead) -1;
+            }else{
+                tar_il = il -1;
+            }
+            int32_t expert_id = management->get_unit(tar_il);
+            GGML_ASSERT(expert_id != -1);
+            pos = table.at(tar_il,expert_id).pos;
+            free_expert(tar_il,expert_id);
+            GGML_ASSERT(pos != -1);
         }  
         load_expert(il,id,pos);
     }
@@ -351,7 +365,7 @@ void custom_moe_unified::load_data(llama_pos offset,uint32_t row, uint32_t col){
 
 }
 
-void custom_moe_unified::load_expert(uint32_t il, uint32_t id,llama_pos target_pos){
+void custom_moe_unified::load_expert(uint32_t il, int32_t id,llama_pos target_pos){
     //load
     load_data(target_pos,il,id);
     //update table
@@ -370,9 +384,18 @@ void custom_moe_unified::load_layer(uint32_t il, llama_pos target_pos){
     }
     //update table
     table.mark_layer(il,expert_state::InMemory,target_pos);
-
+    //update mange
+    manage.get()->active_layer(il);
 }
 
+void custom_moe_unified::free_expert(uint32_t il,int32_t id){
+    table.mark(il,id,expert_state::OnDisk,-1);
+    manage.get()->erase(il,id);
+}
+void custom_moe_unified::free_layer(uint32_t il){
+    table.mark_layer(il,expert_state::OnDisk,-1);
+    manage.get()->erase_layer(il);
+}
 /* 
 input: 
     n: num of slots  
@@ -425,9 +448,6 @@ void custom_moe_unified::pool_free(llama_pos pos, int32_t n){
     }
     
 }
-//
-//custom op_kernel
-//
 
 /*
 multi-thread
@@ -478,6 +498,10 @@ void id_pos_map(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith
     auto it = moe_unified->name_layer_map.find(a_name);
     GGML_ASSERT(it != moe_unified->name_layer_map.end());
     uint32_t il = it->second;
+
+    //get management_handle
+    auto manage = moe_unified->manage.get();
+
     //wait to check layer state when prefill
     static CallSync sync;
     sync.wait_initialization([&]{
@@ -493,7 +517,8 @@ void id_pos_map(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith
         //mapping
         for(int i = ie0; i < ie1; i++){
             for(int j = 0; j < n_ids; j++){
-
+                //TBD: warnning! multithread erro
+                // manage->hit(il,a_data[i*(a->nb[1] / 4) + j]);
                 dst_data[i*(dst->nb[1] / 4) +j] = moe_unified->id_map(il,a_data[i*(a->nb[1] / 4) + j]);
             }
         }
@@ -503,6 +528,7 @@ void id_pos_map(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith
             for(int i = 0; i < n_ids; i++){
                 //check
                 moe_unified->check_expert(il,a_data[i]);
+                manage->hit(il,a_data[i]);
                 //mapping
                 dst_data[i] = moe_unified->id_map(il,a_data[i]);
             }
