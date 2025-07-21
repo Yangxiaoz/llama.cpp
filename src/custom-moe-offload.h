@@ -137,8 +137,7 @@ private:
     custom_expert_table&                                            table;
     custom_expert_pool&                                             pool;
     std::vector<std::set<ActiveUnit>>                               active_set;
-    std::unordered_map<int, std::unordered_map<int, ActiveUnit>>    active_map; 
-    // std::set<ActiveUnit>                                            active_set;                
+    std::unordered_map<int, std::unordered_map<int, ActiveUnit>>    active_map;                
 
 public: 
     custom_expert_manage(custom_expert_table& table,custom_expert_pool& pool);

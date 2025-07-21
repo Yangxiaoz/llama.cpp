@@ -166,9 +166,12 @@ void custom_moe_unified::prefill_init(){
 
 void custom_moe_unified::check_layer(uint32_t il){
     if(table.layer_state.at(il) == expert_state::OnDisk){
+        GGML_ASSERT(il > 0);//the first layer should always be activate
         uint32_t prev_il = il -1;
-        GGML_ASSERT(table.at(prev_il,LAYER_HEAD).state = expert_state::InMemory);
 
+        //TEMP: tempprary implementation 
+        //always use the pool of prev layer to load cur layer of weight
+        GGML_ASSERT(table.at(prev_il,LAYER_HEAD).state = expert_state::InMemory);
         //Reuse the pool of prev_layer for cur_layer
         llama_pos pos = table.at(prev_il,LAYER_HEAD).pos;
         //free the prev_layer in table
@@ -501,16 +504,16 @@ void id_pos_map(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith
 
     //get management_handle
     auto manage = moe_unified->manage.get();
-
-    //wait to check layer state when prefill
-    static CallSync sync;
-    sync.wait_initialization([&]{
-        if(prefill)moe_unified->check_layer(il);
-    });
-
+    
     int n_ids   = a->ne[0];
     int n_token = a->ne[1];
+    //wait to check layer state when prefill
+    static CallSync sync;
     if(prefill){// parallel
+        //only first thread will call  
+        sync.wait_initialization([&]{
+        if(prefill)moe_unified->check_layer(il);
+        });
         const int dr = (n_token + nth - 1) / nth;
         const int ie0 = dr * ith;
         const int ie1 = MIN(ie0 + dr, n_token);
@@ -528,6 +531,7 @@ void id_pos_map(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith
             for(int i = 0; i < n_ids; i++){
                 //check
                 moe_unified->check_expert(il,a_data[i]);
+                //record the hit event
                 manage->hit(il,a_data[i]);
                 //mapping
                 dst_data[i] = moe_unified->id_map(il,a_data[i]);

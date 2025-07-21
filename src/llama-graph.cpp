@@ -485,6 +485,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn_offload(
                float   w_scale,
          llama_expert_gating_func_type gating_op,
                 int   il) const {
+    //CUSTOM_MOE func
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -527,8 +528,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn_offload(
     cb(selected_experts, "ffn_moe_topk", il);
     ggml_build_forward_expand(gf, selected_experts);
 
-    // record the <select_name,index_layer>map
+    // record the <select_name,index_layer> in a map
     moe_unified->name_layer_map.emplace(selected_experts->name,il - hparams.n_layer_dense_lead);
+    //operator defined by customer  
     ggml_tensor * select_map = ggml_map_custom1(ctx0, selected_experts, id_pos_map, 1, moe_unified);
     cb(select_map, "moe_topk_pos", il);
     ggml_build_forward_expand(gf, select_map);

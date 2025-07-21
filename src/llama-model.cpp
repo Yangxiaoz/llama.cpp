@@ -1584,8 +1584,6 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
     
-
-
     const auto TENSOR_EXPERT_WEIGHT   = llama_model_loader::TENSOR_EXPERT_WEIGHT;
 #endif
     const auto TENSOR_DUPLICATED   = llama_model_loader::TENSOR_DUPLICATED;
