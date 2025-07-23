@@ -11,7 +11,8 @@
               "CMAKE_INSTALL_RPATH": "$ORIGIN;$ORIGIN/..",
               "CMAKE_BUILD_PARALLEL_LEVEL": "14",
               "GGML_CCACHE": "ON",
-              "LLAMA_CURL": "OFF"
+              "LLAMA_CURL": "OFF",
+              "ENABLE_CUSTOM_MOE": "ON"
           }
       },
       {
@@ -79,8 +80,8 @@
               "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/cmake/arm64-apple-clang.cmake"
           }
       },
-      { "name": "cpu-debug", "inherits": [ "linux-base","debug" ] },
-      { "name": "cuda-debug", "inherits": [ "linux-base","debug","cuda" ] },
+      { "name": "cpu-debug", "inherits": [ "linux-base","debug","aarch64_off" ] },
+      { "name": "cuda-debug", "inherits": [ "linux-base","debug","aarch64_off","cuda" ] },
       { "name": "arm64-windows-llvm-debug", "inherits": [ "base", "arm64-windows-llvm", "debug" ] },
       { "name": "arm64-windows-llvm-release", "inherits": [ "base", "arm64-windows-llvm", "reldbg" ] },
       { "name": "arm64-windows-llvm+static-release", "inherits": [ "base", "arm64-windows-llvm", "reldbg", "static" ] },

@@ -1892,6 +1892,26 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         return it->second;
     };
 
+#ifdef CUSTOM_MOE
+    //TBD: the moe_ctx seemly no used
+    int n_expert_layer = hparams.n_layer - hparams.n_layer_dense_lead;
+    const size_t moe_ctx_size = n_expert_layer * 3 * ggml_tensor_overhead();
+    ggml_context * moe_table_ctx = nullptr;
+    {
+        ggml_init_params params = {
+            /*.mem_size   =*/ moe_ctx_size,
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        moe_table_ctx = ggml_init(params);
+
+        if (!moe_table_ctx) {
+            throw std::runtime_error(format("failed to create ggml context"));
+        }
+    }
+    
+    const auto TENSOR_EXPERT_WEIGHT   = llama_model_loader::TENSOR_EXPERT_WEIGHT;
+#endif
     const auto TENSOR_DUPLICATED   = llama_model_loader::TENSOR_DUPLICATED;
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
@@ -2039,7 +2059,18 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 }
             }
 
-            ggml_context * ctx = ctx_for_buft(buft);
+            #ifdef CUSTOM_MOE
+                ggml_context * ctx = nullptr;
+                if(flags & TENSOR_EXPERT_WEIGHT){//use moe_ctx
+                    ctx = moe_table_ctx;
+                }
+                else{//defualt
+                    ctx = ctx_for_buft(buft);
+                }
+                GGML_ASSERT(ctx != nullptr&& "erro create ctx in load tensor");
+            #else
+                ggml_context * ctx = ctx_for_buft(buft);
+            #endif
 
             // if duplicated, check if the original tensor was allocated in the same buffer type context and avoid creating a new one
             if (flags & TENSOR_DUPLICATED) {
@@ -4050,9 +4081,16 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             }
 
                             // MoE branch
+                        #ifdef CUSTOM_MOE //arc related
+                            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, TENSOR_EXPERT_WEIGHT);
+                            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, TENSOR_EXPERT_WEIGHT);
+                            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, TENSOR_EXPERT_WEIGHT);
+
+                        #else
                             layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
                             layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
                             layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+                        #endif
 
                             // Shared expert branch
                             layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, n_ff_exp * n_expert_shared}, 0);
@@ -5174,7 +5212,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     }
 
     ml.done_getting_tensors();
-
+#ifdef CUSTOM_MOE
+    table_ctx.reset(moe_table_ctx);
+#endif
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
@@ -5261,6 +5301,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
         ctx_bufs.emplace_back(ctx, buf_map);
     }
+
 
     if (llama_supports_gpu_offload()) {
         const int n_gpu = std::min(n_gpu_layers, int(hparams.n_layer));
@@ -12415,6 +12456,18 @@ struct llm_build_deepseek2 : public llm_graph_context {
                 cb(cur, "ffn_out", il);
             } else {
                 // MoE branch
+            #ifdef CUSTOM_MOE
+                ggml_tensor * moe_out =
+                    build_moe_ffn_offload(gf,cur,
+                            model.layers[il].ffn_gate_inp,
+                            model.layers[il].ffn_exp_probs_b,
+                            model.moe_unified.get(),
+                            n_expert, n_expert_used,
+                            LLM_FFN_SILU, hparams.expert_weights_norm,
+                            true, hparams.expert_weights_scale,
+                            (llama_expert_gating_func_type) hparams.expert_gating_func,
+                            il);
+            #else
                 ggml_tensor * moe_out =
                     build_moe_ffn(cur,
                             model.layers[il].ffn_gate_inp,
@@ -12427,6 +12480,7 @@ struct llm_build_deepseek2 : public llm_graph_context {
                             true, hparams.expert_weights_scale,
                             (llama_expert_gating_func_type) hparams.expert_gating_func,
                             il);
+            #endif
                 cb(moe_out, "ffn_moe_out", il);
 
                 // FFN shared expert
@@ -17470,6 +17524,9 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+#ifdef CUSTOM_MOE
+        /*.moe_memory_utilization      =*/(float)0.3,
+#endif
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,
         /*.use_mlock                   =*/ false,

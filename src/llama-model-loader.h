@@ -60,6 +60,9 @@ struct llama_model_loader {
 
     static const int TENSOR_NOT_REQUIRED = 1;
     static const int TENSOR_DUPLICATED   = 2;
+    #ifdef CUSTOM_MOE
+    static const int TENSOR_EXPERT_WEIGHT = 4;//1<<2
+    #endif
 
     int n_kv      = 0;
     int n_tensors = 0;

@@ -12,6 +12,9 @@
 #include <unordered_map>
 #include <vector>
 
+#ifdef CUSTOM_MOE
+#include "custom-moe-offload.h"
+#endif
 struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
@@ -397,7 +400,10 @@ struct llama_model {
     struct ggml_tensor * per_layer_proj_norm  = nullptr;
 
     std::vector<llama_layer> layers;
-
+#ifdef CUSTOM_MOE
+    ggml_context_ptr         table_ctx;
+    std::unique_ptr<custom_moe_unified> moe_unified;
+#endif
     llama_model_params params;
 
     // gguf metadata

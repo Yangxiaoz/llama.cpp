@@ -60,6 +60,14 @@ endif()
 # option list
 #
 
+# custom_moe opt
+option(ENABLE_CUSTOM_MOE "Enable CUSTOM_MOE features" OFF)
+
+if(ENABLE_CUSTOM_MOE)
+    message(STATUS "CUSTOM_MOE offload enable")
+    add_compile_definitions(CUSTOM_MOE)  
+endif()
+
 # debug
 option(LLAMA_ALL_WARNINGS           "llama: enable all compiler warnings"                   ON)
 option(LLAMA_ALL_WARNINGS_3RD_PARTY "llama: enable all compiler warnings in 3rd party libs" OFF)

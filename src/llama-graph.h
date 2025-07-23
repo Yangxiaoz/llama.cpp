@@ -16,7 +16,9 @@ struct ggml_context;
 struct ggml_tensor;
 
 struct llama_cparams;
-
+#ifdef CUSTOM_MOE
+class custom_moe_unified;
+#endif
 struct llama_memory_context_i;
 
 class llama_kv_cache_unified_context;
@@ -570,7 +572,22 @@ struct llm_graph_context {
     //
     // common
     //
-
+#ifdef CUSTOM_MOE
+    ggml_tensor * build_moe_ffn_offload(
+            ggml_cgraph * gf,
+             ggml_tensor * cur,
+             ggml_tensor * gate_inp,
+             ggml_tensor * exp_probs_b,
+      custom_moe_unified * moe_unified,
+                 int64_t   n_expert,
+                 int64_t   n_expert_used,
+         llm_ffn_op_type   type_op,
+                    bool   norm_w,
+                    bool   scale_w,
+                   float   w_scale,
+            llama_expert_gating_func_type gating_op,
+                     int   il) const;
+#endif
     ggml_tensor * build_cvec(
              ggml_tensor * cur,
                      int   il) const;
