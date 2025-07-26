@@ -37,9 +37,13 @@ struct llama_hparams;
 struct llama_model;
 struct llama_context;
 
+enum io_mode{
+    block,
+    async
+};
 enum expert_state{
     OnDisk,
-    Loding,
+    Loading,
     InMemory
 };
 struct custom_tensor_mmap{
@@ -66,11 +70,10 @@ struct custom_expert_pool{
 class custom_async_io{
     private:
     int                 fd;
-    io_uring            ring;
-    io_uring_params     params{};
-
     public:
-    custom_async_io(const std::string & fname,int queue_depth = 64){
+
+    custom_async_io(const std::string & fname,int queue_depth = 512){
+        //no params is no used yet
         int ret = io_uring_queue_init_params(queue_depth, &ring, &params);
         if (ret < 0) {
             throw std::runtime_error("Failed to initialize io_uring: " + std::string(strerror(-ret)));
@@ -88,9 +91,12 @@ class custom_async_io{
         io_uring_queue_exit(&ring);
         close(fd);
     }
-
+    //menbers
+    io_uring            ring;
+    io_uring_params     params{};
+    //func
     void block_read(char * buf, size_t size, size_t offset);
-    bool async_read(int idx,char * buf,size_t size = 0, size_t offset = 0);
+    bool async_submit(int idx,char * buf,size_t size, size_t offset);
     // void block_check();
 };
 
@@ -128,24 +134,27 @@ public:
 
     void mark(uint32_t row, int32_t col, expert_state state, llama_pos pos){
         check_indices(row,col);
-        if(state == expert_state::InMemory){
-            experts[row][col].pos   = pos;
-        } else{
+        if(state == expert_state::OnDisk){
             experts[row][col].pos   = -1;
+        } else if(state == expert_state::Loading){
+            experts[row][col].pos   = pos;
         }
         experts[row][col].state = state;
     }
+    //note:
+    //when use the mark_layer, there is no need to set expert_state to 'Loading',but set it directly to 'InMemory'
+    //Due to In layer mode,we check the <vector> layer_state instead of expert_state.
     void mark_layer(uint32_t row, expert_state state, llama_pos head_pos){
         check_indices(row,0);
-        if(state == expert_state::InMemory){
-            for(int32_t i =0; i < n_col; i++){
-                experts[row][i].pos = head_pos + i;
-                experts[row][i].state = state;
-            }
-        } else{
+        if(state == expert_state::OnDisk){
             for(int32_t i =0; i < n_col; i++){
                 experts[row][i].pos = -1;
                 experts[row][i].state = state;
+            }
+        } else if(state == expert_state::Loading){
+            for(int32_t i =0; i < n_col; i++){
+                experts[row][i].pos = head_pos + i;
+                experts[row][i].state = expert_state::InMemory;
             }
         }
         layer_state[row] = state;
@@ -235,7 +244,8 @@ public:
     // custom_moe_unified  API
     //
     uint32_t                                total_size() const;
-    void                                    prefill_init();
+    void                                    prefill_init();//pre-load the initial some layer of moe_weight
+    void                                    table_refresh();//refresh the table status due to async transmission
     void                                    check_layer(uint32_t il);
     void                                    check_expert(uint32_t il,uint32_t id);
     llama_pos                               id_map(uint32_t il, int32_t selec_id);
@@ -259,7 +269,7 @@ private:
     uint32_t                                n_slots_layer;    // number of slots in one layer
     struct  custom_pool_type                pool_type;
     struct  custom_expert_pool              pool;
-    custom_async_io                         async_io;       
+    class   custom_async_io                 async_io;       
     class   custom_expert_table             table;    
     std::vector<ggml_context_ptr>           ctxs;
     std::vector<ggml_backend_buffer_ptr>    bufs;
@@ -269,8 +279,8 @@ private:
     void        table_init(const llama_model & model,llama_model_loader & ml);
     uint32_t    get_padding() const;
     void        load_data(llama_pos offset,uint32_t table_row, uint32_t table_col);
-    void        load_expert(uint32_t il, int32_t id,llama_pos target_pos);
-    void        load_layer(uint32_t il, llama_pos target_pos);
+    void        load_expert(uint32_t il, int32_t id,llama_pos target_pos,io_mode mode);
+    void        load_layer(uint32_t il, llama_pos target_pos,io_mode mode);
     void        free_expert(uint32_t il,int32_t id);
     void        free_layer(uint32_t il);
     //

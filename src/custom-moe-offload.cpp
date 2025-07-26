@@ -13,7 +13,7 @@
 
 
 void custom_async_io::block_read(char * buf, size_t size, size_t offset){
-    // get sqe
+    // get sqe_handle
     struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
     if (!sqe) {
         throw std::runtime_error("Failed to get SQE");
@@ -23,13 +23,14 @@ void custom_async_io::block_read(char * buf, size_t size, size_t offset){
     sqe->flags |= IOSQE_FIXED_FILE;
 
     // submit
-    if (io_uring_submit(&ring) < 0) {
-        throw std::runtime_error("custom_asyncio::Failed to submit request");
+    int ret = io_uring_submit(&ring);
+    if (ret < 0) {
+        throw std::runtime_error("custom_asyncio::Failed to submit request:" + std::string(strerror(-ret)));
     }
 
     // waiting for complete
     struct io_uring_cqe* cqe;
-    int ret = io_uring_wait_cqe(&ring, &cqe);
+    ret = io_uring_wait_cqe(&ring, &cqe);
     if (ret < 0) {
         throw std::runtime_error("custom_asyncio::Failed to wait for completion:" + std::string(strerror(-ret)));
     }
@@ -41,8 +42,23 @@ void custom_async_io::block_read(char * buf, size_t size, size_t offset){
     }
 }
 
-bool custom_async_io::async_read(int idx,char * buf,size_t size = 0, size_t offset = 0){
-
+bool custom_async_io::async_submit(int idx,char * buf,size_t size, size_t offset){
+    // get sqe_handle
+    struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+    if (!sqe) {
+        printf("erro sqe get \n");
+        return false;
+    }
+    io_uring_prep_read(sqe, 0, buf, size, offset);//0: the index of register file
+    sqe->flags |= IOSQE_FIXED_FILE;
+    sqe->user_data = idx;
+    // 提交请求
+    int ret = io_uring_submit(&ring);
+    if (ret < 0) {
+        printf("erro sqe submit \n");
+        return false;
+    }
+    return true;
 }
 
 custom_expert_table::custom_expert_table(uint32_t n_moe_layer, uint32_t n_expert)
@@ -189,31 +205,62 @@ void custom_moe_unified::prefill_init(){
     
     for(uint32_t il = 0; il < n_layer_load; il++){
         llama_pos slot_pos = pool_alloc(n_slots_layer);
-        load_layer(il,slot_pos);
+        load_layer(il,slot_pos,io_mode::block);
     }
     
     LLAMA_LOG_INFO("custom_moe prefill init: %d layers have been pre-load",n_layer_load);
 }
 
+void custom_moe_unified::table_refresh(){
+    io_uring*  ring = &async_io.ring;     
+    struct io_uring_cqe* cqe;
+
+    while (io_uring_peek_cqe(ring, &cqe) == 0)
+    {
+        if(cqe->res < 0){
+            throw std::runtime_error("Read failed: " + std::string(strerror(-cqe->res)));
+        }else{
+            int request_id = static_cast<int>(cqe->user_data);
+            int il = request_id / 64;
+            int id = request_id % 64;
+            // update table
+            //TBD: need to careful rethink
+            table.mark(il,id,expert_state::InMemory,0);
+
+            // 标记已处理
+            io_uring_cqe_seen(ring, cqe);
+
+        }
+        
+    }
+}                                  
+
 void custom_moe_unified::check_layer(uint32_t il){
-    if(table.layer_state.at(il) == expert_state::OnDisk){
+    auto state = table.layer_state.at(il);
+    
+    if(state == expert_state::OnDisk){
         GGML_ASSERT(il > 0);//the first layer should always be activate
         uint32_t prev_il = il -1;
 
         //TEMP: tempprary implementation 
         //always use the pool of prev layer to load cur layer of weight
-        GGML_ASSERT(table.at(prev_il,LAYER_HEAD).state = expert_state::InMemory);
+        
+        GGML_ASSERT(table.layer_state.at(prev_il) = expert_state::InMemory);
         //Reuse the pool of prev_layer for cur_layer
         llama_pos pos = table.at(prev_il,LAYER_HEAD).pos;
         //free the prev_layer in table
         free_layer(prev_il);
         //load layer to pool
-        load_layer(il,pos);
-    } 
+        load_layer(il,pos,io_mode::block);
+    }else if(state == expert_state::Loading){
+        GGML_ABORT("erro brance");
+        //TBD: need to be impl
+    }
 }
 
 void custom_moe_unified::check_expert(uint32_t il,uint32_t id){
-    if(table.at(il,id).state == expert_state::OnDisk){
+    auto state = table.at(il,id).state;
+    if(state == expert_state::OnDisk){
         llama_pos pos = pool_alloc(1);
         if(pos == -1){
             auto management = manage.get();
@@ -229,7 +276,10 @@ void custom_moe_unified::check_expert(uint32_t il,uint32_t id){
             free_expert(tar_il,expert_id);
             GGML_ASSERT(pos != -1);
         }  
-        load_expert(il,id,pos);
+        load_expert(il,id,pos,io_mode::block);
+    }else if(state == expert_state::Loading){
+        GGML_ABORT("erro brance");
+        //TBD: need to be impl
     }
 }
 //mapping the select_id to pos of pool
@@ -345,61 +395,29 @@ uint32_t custom_moe_unified::get_padding() const {
 }
 
 void custom_moe_unified::load_data(llama_pos offset,uint32_t row, uint32_t col){
-    std::vector<no_init<uint8_t>> read_buf;
+
     uint16_t    idx  = table.at(row,col).up.idx;
     GGML_ASSERT(table.at(row,col).gate.idx == idx && table.at(row,col).down.idx == idx);
 
     size_t      up_offs = table.at(row,col).up.offs;
     size_t      gate_offs = table.at(row,col).gate.offs;
     size_t      down_offs = table.at(row,col).down.offs;
-    //TBD: need create nbyte_expert vector  in (table_init)?
-    if (ggml_backend_buffer_is_host(pool.up->buffer)) {
-        async_io.block_read(static_cast<char*>(pool.up->data) + offset * nbyte_slot_up,nbyte_slot_up,up_offs);
-        async_io.block_read(static_cast<char*>(pool.gate->data) + offset * nbyte_slot_gate,nbyte_slot_gate,gate_offs);
-        async_io.block_read(static_cast<char*>(pool.down->data) + offset * nbyte_slot_down,nbyte_slot_down,down_offs);
-
-    } else{
-            throw std::runtime_error("moe_unified can't support device load now!");
-            if (0) {//async load
-                // file->seek(weight->offs, SEEK_SET);
-
-                // size_t bytes_read = 0;
-
-                // while (bytes_read < n_size) {
-                //     size_t read_iteration = std::min<size_t>(buffer_size, n_size - bytes_read);
-
-                //     ggml_backend_event_synchronize(events[buffer_idx]);
-                //     file->read_raw(host_ptrs[buffer_idx], read_iteration);
-                //     ggml_backend_tensor_set_async(upload_backend, cur, host_ptrs[buffer_idx], bytes_read, read_iteration);
-                //     ggml_backend_event_record(events[buffer_idx], upload_backend);
-
-                //     bytes_read += read_iteration;
-                //     ++buffer_idx;
-                //     buffer_idx %= n_buffers;
-                // }
-            } else {
-                // read_buf.resize(nbyte_slot_down);
-                // GGML_ASSERT(nbyte_slot_down > nbyte_slot_up && nbyte_slot_down > nbyte_slot_gate);
-                // file->seek(up_offs, SEEK_SET);
-                // file->read_raw(read_buf.data(),nbyte_slot_up);
-                // ggml_backend_tensor_set(pool.up, read_buf.data(), offset * nbyte_slot_up, nbyte_slot_up);
-                // file->seek(gate_offs, SEEK_SET);
-                // file->read_raw(read_buf.data(), nbyte_slot_gate);
-                // ggml_backend_tensor_set(pool.gate, read_buf.data(), offset * nbyte_slot_gate,nbyte_slot_gate);
-                // file->seek(down_offs, SEEK_SET);
-                // //TBD the n_size should be check
-                // file->read_raw(read_buf.data(), nbyte_slot_down);
-                // ggml_backend_tensor_set(pool.down, read_buf.data(), offset * nbyte_slot_down, nbyte_slot_down);
-            }
-    }
-
+    //TBD: need create nbyte_expert vector  in (table_init)?;
+    GGML_ASSERT(ggml_backend_buffer_is_host(pool.up->buffer));
+    async_io.block_read(static_cast<char*>(pool.up->data) + offset * nbyte_slot_up,nbyte_slot_up,up_offs);
+    async_io.block_read(static_cast<char*>(pool.gate->data) + offset * nbyte_slot_gate,nbyte_slot_gate,gate_offs);
+    async_io.block_read(static_cast<char*>(pool.down->data) + offset * nbyte_slot_down,nbyte_slot_down,down_offs);
 }
 
-void custom_moe_unified::load_expert(uint32_t il, int32_t id,llama_pos target_pos){
-    //load
-    load_data(target_pos,il,id);
-    //update table
-    table.mark(il,id,expert_state::InMemory,target_pos);
+void custom_moe_unified::load_expert(uint32_t il, int32_t id,llama_pos target_pos,io_mode mode){
+    if(mode == io_mode::block){//blocking load data
+        load_data(target_pos,il,id);
+        //update table
+        table.mark(il,id,expert_state::InMemory,target_pos);
+    }else{
+        //async submit data
+        GGML_ABORT("erro brance");
+    }
 }
 
 
@@ -408,12 +426,17 @@ input:
     il:         the id of table_layer
     target_pos: the pos of pool load to
 */
-void custom_moe_unified::load_layer(uint32_t il, llama_pos target_pos){        
-    for(size_t i = 0; i < hparams.n_expert; i++){
-        load_data(target_pos + i,il,i);
+void custom_moe_unified::load_layer(uint32_t il, llama_pos target_pos,io_mode mode){
+    if(mode == io_mode::block){
+        table.mark_layer(il,expert_state::Loading,target_pos);
+        for(size_t i = 0; i < hparams.n_expert; i++){
+            load_data(target_pos + i,il,i);
+        }
+        table.mark_layer(il,expert_state::InMemory,0);
+    }else{
+        //async submit
+        GGML_ABORT("erro brance");
     }
-    //update table
-    table.mark_layer(il,expert_state::InMemory,target_pos);
     //update mange
     manage.get()->active_layer(il);
 }
@@ -537,8 +560,8 @@ void id_pos_map(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith
     //wait to check layer state when prefill
     static CallSync sync;
     if(prefill){// parallel
-        //only first thread will call  
-        sync.wait_initialization([&]{
+        //prefill check
+        sync.wait_initialization([&]{//only first thread will call 
         if(prefill)moe_unified->check_layer(il);
         });
         const int dr = (n_token + nth - 1) / nth;
