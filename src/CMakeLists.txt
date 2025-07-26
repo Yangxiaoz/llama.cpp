@@ -1,5 +1,14 @@
 llama_add_compile_flags()
 
+#custom add:
+# check liburing
+find_library(LIBURING_LIBRARY NAMES uring)
+if(NOT LIBURING_LIBRARY)
+    message(FATAL_ERROR "liburing 未找到 - 请安装: sudo apt install liburing-dev")
+endif()
+find_path(LIBURING_INCLUDE_DIR NAMES liburing.h)
+#end
+
 #
 # libraries
 #
@@ -37,6 +46,17 @@ add_library(llama
             unicode.cpp
             unicode.h
             )
+#custom add
+# target_include_directories(llama PRIVATE ${LIBURING_LIBRARY})
+if(LIBURING_INCLUDE_DIR AND LIBURING_LIBRARY)
+    message(STATUS "liburing found")
+    target_include_directories(llama PRIVATE ${LIBURING_INCLUDE_DIR})
+    target_link_libraries(llama PRIVATE ${LIBURING_LIBRARY})
+    target_compile_definitions(llama PRIVATE LLAMA_USE_LIBURING)
+else()
+    message(WARNING "liburing not found - custom-moe-offload.cpp will be compiled without io_uring support")
+endif()
+#end
 
 target_include_directories(llama PRIVATE .)
 target_include_directories(llama PUBLIC ../include)

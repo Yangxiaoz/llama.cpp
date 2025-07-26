@@ -1,5 +1,6 @@
 #include "custom-moe-offload.h"
 
+#include "ggml-cpp.h"
 #include "llama-model.h"
 #include "llama-impl.h"
 
@@ -7,21 +8,50 @@
 #include <cassert>
 #include <cmath>
 #include <limits>
-#include <map>
-#include <random>
-#include <mutex>
-#include <atomic>
-#include <stdexcept>
+
 #include <condition_variable>
 
 
+void custom_async_io::block_read(char * buf, size_t size, size_t offset){
+    // get sqe
+    struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+    if (!sqe) {
+        throw std::runtime_error("Failed to get SQE");
+    }
+
+    io_uring_prep_read(sqe, 0, buf, size, offset);//0: the index of register file
+    sqe->flags |= IOSQE_FIXED_FILE;
+
+    // submit
+    if (io_uring_submit(&ring) < 0) {
+        throw std::runtime_error("custom_asyncio::Failed to submit request");
+    }
+
+    // waiting for complete
+    struct io_uring_cqe* cqe;
+    int ret = io_uring_wait_cqe(&ring, &cqe);
+    if (ret < 0) {
+        throw std::runtime_error("custom_asyncio::Failed to wait for completion:" + std::string(strerror(-ret)));
+    }
+    //clean cur cqe
+    int read_bytes = cqe->res;
+    io_uring_cqe_seen(&ring, cqe);
+    if (read_bytes < 0) {
+        throw std::runtime_error("custom_asyncio::Read failed in block reading");
+    }
+}
+
+bool custom_async_io::async_read(int idx,char * buf,size_t size = 0, size_t offset = 0){
+
+}
 
 custom_expert_table::custom_expert_table(uint32_t n_moe_layer, uint32_t n_expert)
-    :  experts(n_moe_layer,std::vector<custom_expert_group>(n_expert)),
-       layer_type(n_moe_layer),
-       layer_state(n_moe_layer,OnDisk),
-       n_row(n_moe_layer),
-       n_col(n_expert){}
+    :n_row(n_moe_layer), 
+     n_col(n_expert),
+     experts(n_moe_layer,std::vector<custom_expert_group>(n_expert)),
+     layer_type(n_moe_layer),
+     layer_state(n_moe_layer,OnDisk){}
+
 
 custom_expert_manage::custom_expert_manage(custom_expert_table& table,custom_expert_pool& pool):table(table),pool(pool){
     uint32_t n_row = table.row_size();
@@ -39,6 +69,7 @@ custom_expert_manage::custom_expert_manage(custom_expert_table& table,custom_exp
 custom_moe_unified::custom_moe_unified(const llama_model & model,float utilization,const std::string & fname,llama_model_loader & ml) 
     : model(model),
       hparams(model.hparams),
+      async_io(fname),
       table(hparams.n_layer - hparams.n_layer_dense_lead, hparams.n_expert){
     uint32_t n_expert = hparams.n_expert;
     //select the last layer as typical expert
@@ -61,7 +92,7 @@ custom_moe_unified::custom_moe_unified(const llama_model & model,float utilizati
     this->n_slots_layer     = n_expert;
 
     //init the table
-    table_init(model,fname,ml);
+    table_init(model,ml);
 
     //init the moe_pool
     //TBD: need to refactor the logic for buft select
@@ -248,7 +279,7 @@ ggml_tensor * custom_moe_unified::get_downs(struct ggml_context * ctx, uint32_t 
     }
 }
 
-void custom_moe_unified::table_init(const llama_model & model,const std::string & fname,llama_model_loader & ml){
+void custom_moe_unified::table_init(const llama_model & model,llama_model_loader & ml){
 
     custom_expert_table & table = this->table;
 
@@ -259,8 +290,7 @@ void custom_moe_unified::table_init(const llama_model & model,const std::string 
     uint32_t n_dense = hparams.n_layer_dense_lead;
     GGML_ASSERT(n_row == (n_layer - n_dense));
     GGML_ASSERT(n_col == hparams.n_expert);
-    //init files
-    table.files.emplace_back(new llama_file(fname.c_str(), "rb"));
+
 
     std::map<ggml_type,size_t> type_map;
     auto type_for_size = [&](ggml_type type) -> size_t {
@@ -318,22 +348,19 @@ void custom_moe_unified::load_data(llama_pos offset,uint32_t row, uint32_t col){
     std::vector<no_init<uint8_t>> read_buf;
     uint16_t    idx  = table.at(row,col).up.idx;
     GGML_ASSERT(table.at(row,col).gate.idx == idx && table.at(row,col).down.idx == idx);
-    const auto &file = table.files.at(idx);
 
     size_t      up_offs = table.at(row,col).up.offs;
     size_t      gate_offs = table.at(row,col).gate.offs;
     size_t      down_offs = table.at(row,col).down.offs;
     //TBD: need create nbyte_expert vector  in (table_init)?
     if (ggml_backend_buffer_is_host(pool.up->buffer)) {
-        file->seek(up_offs, SEEK_SET);
-        file->read_raw(static_cast<char*>(pool.up->data) + offset * nbyte_slot_up, nbyte_slot_up);
-        
-        file->seek(gate_offs, SEEK_SET);
-        file->read_raw(static_cast<char*>(pool.gate->data) + offset * nbyte_slot_gate, nbyte_slot_gate);
-        file->seek(down_offs, SEEK_SET);
-        file->read_raw(static_cast<char*>(pool.down->data) + offset * nbyte_slot_down, nbyte_slot_down);
+        async_io.block_read(static_cast<char*>(pool.up->data) + offset * nbyte_slot_up,nbyte_slot_up,up_offs);
+        async_io.block_read(static_cast<char*>(pool.gate->data) + offset * nbyte_slot_gate,nbyte_slot_gate,gate_offs);
+        async_io.block_read(static_cast<char*>(pool.down->data) + offset * nbyte_slot_down,nbyte_slot_down,down_offs);
+
     } else{
-            if (0) {//TBD: need to support async load
+            throw std::runtime_error("moe_unified can't support device load now!");
+            if (0) {//async load
                 // file->seek(weight->offs, SEEK_SET);
 
                 // size_t bytes_read = 0;
@@ -351,18 +378,18 @@ void custom_moe_unified::load_data(llama_pos offset,uint32_t row, uint32_t col){
                 //     buffer_idx %= n_buffers;
                 // }
             } else {
-                read_buf.resize( nbyte_slot_down);
-                GGML_ASSERT(nbyte_slot_down > nbyte_slot_up && nbyte_slot_down > nbyte_slot_gate);
-                file->seek(up_offs, SEEK_SET);
-                file->read_raw(read_buf.data(),nbyte_slot_up);
-                ggml_backend_tensor_set(pool.up, read_buf.data(), offset * nbyte_slot_up, nbyte_slot_up);
-                file->seek(gate_offs, SEEK_SET);
-                file->read_raw(read_buf.data(), nbyte_slot_gate);
-                ggml_backend_tensor_set(pool.gate, read_buf.data(), offset * nbyte_slot_gate,nbyte_slot_gate);
-                file->seek(down_offs, SEEK_SET);
-                //TBD the n_size should be check
-                file->read_raw(read_buf.data(), nbyte_slot_down);
-                ggml_backend_tensor_set(pool.down, read_buf.data(), offset * nbyte_slot_down, nbyte_slot_down);
+                // read_buf.resize(nbyte_slot_down);
+                // GGML_ASSERT(nbyte_slot_down > nbyte_slot_up && nbyte_slot_down > nbyte_slot_gate);
+                // file->seek(up_offs, SEEK_SET);
+                // file->read_raw(read_buf.data(),nbyte_slot_up);
+                // ggml_backend_tensor_set(pool.up, read_buf.data(), offset * nbyte_slot_up, nbyte_slot_up);
+                // file->seek(gate_offs, SEEK_SET);
+                // file->read_raw(read_buf.data(), nbyte_slot_gate);
+                // ggml_backend_tensor_set(pool.gate, read_buf.data(), offset * nbyte_slot_gate,nbyte_slot_gate);
+                // file->seek(down_offs, SEEK_SET);
+                // //TBD the n_size should be check
+                // file->read_raw(read_buf.data(), nbyte_slot_down);
+                // ggml_backend_tensor_set(pool.down, read_buf.data(), offset * nbyte_slot_down, nbyte_slot_down);
             }
     }
 

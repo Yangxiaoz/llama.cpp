@@ -1,16 +1,24 @@
 #pragma once
 
-
 #include "llama.h"
 #include "llama-io.h"
 #include "llama-graph.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model-loader.h"
-#include "ggml-cpp.h"
+
 #include <set>
 #include <vector>
 #include <stdexcept>
+#include <mutex>
+#include <atomic>
+#include <cstring>  
+#include <map>
+#include <random>
+#include <fcntl.h>  
+#include <unistd.h>  
+#include <liburing.h> 
+
 
 #define M_PAD(x, n) (((x) + (n) - 1) & ~((n) - 1))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -31,6 +39,7 @@ struct llama_context;
 
 enum expert_state{
     OnDisk,
+    Loding,
     InMemory
 };
 struct custom_tensor_mmap{
@@ -54,13 +63,49 @@ struct custom_expert_pool{
     std::map<llama_pos, int32_t>    free_slots;
 };
 
+class custom_async_io{
+    private:
+    int                 fd;
+    io_uring            ring;
+    io_uring_params     params{};
+
+    public:
+    custom_async_io(const std::string & fname,int queue_depth = 64){
+        int ret = io_uring_queue_init_params(queue_depth, &ring, &params);
+        if (ret < 0) {
+            throw std::runtime_error("Failed to initialize io_uring: " + std::string(strerror(-ret)));
+        }
+        fd = open(fname.c_str(), O_RDONLY);// note: O_DIRECT is currently not be support
+        if (fd < 0) {
+            throw std::runtime_error("Failed to open file: " + std::string(strerror(errno)));
+        }
+        //register the fd 
+        int fixed_fds[] = {fd};
+        io_uring_register_files(&ring,fixed_fds,1);
+
+    }
+    ~custom_async_io(){
+        io_uring_queue_exit(&ring);
+        close(fd);
+    }
+
+    void block_read(char * buf, size_t size, size_t offset);
+    bool async_read(int idx,char * buf,size_t size = 0, size_t offset = 0);
+    // void block_check();
+};
+
 class custom_expert_table{
+private:
+    uint32_t n_row;
+    int32_t n_col;
+    //func:
+    void check_indices(uint32_t row, int32_t col) const {
+        GGML_ASSERT((row < n_row)&& (0 <= col)&& (col < n_col) && "expert_table index out of bounds");
+    }
 
 public:
     custom_expert_table(uint32_t n_moe_layer, uint32_t n_expert);
 //members
-    
-    llama_files                                     files;
     std::vector<std::vector<custom_expert_group>>   experts;
     std::vector<std::array<ggml_type, NUM_EXPERT>>  layer_type; //up gate down
     std::vector<expert_state>                       layer_state;//used for layer_check when prefill
@@ -112,13 +157,7 @@ public:
     int32_t col_size(){
         return n_col;
     }
-private:
-    uint32_t n_row;
-    int32_t n_col;
-    //func:
-    void check_indices(uint32_t row, int32_t col) const {
-        GGML_ASSERT((row < n_row)&& (col < n_col) && "expert_table index out of bounds");
-    }
+
 };
 
 class custom_expert_manage {
@@ -219,14 +258,15 @@ private:
     uint32_t                                nbyte_slot_down;
     uint32_t                                n_slots_layer;    // number of slots in one layer
     struct  custom_pool_type                pool_type;
-    struct  custom_expert_pool              pool;       
+    struct  custom_expert_pool              pool;
+    custom_async_io                         async_io;       
     class   custom_expert_table             table;    
     std::vector<ggml_context_ptr>           ctxs;
     std::vector<ggml_backend_buffer_ptr>    bufs;
     //
     //common
     //
-    void        table_init(const llama_model & model,const std::string & fname,llama_model_loader & ml);
+    void        table_init(const llama_model & model,llama_model_loader & ml);
     uint32_t    get_padding() const;
     void        load_data(llama_pos offset,uint32_t table_row, uint32_t table_col);
     void        load_expert(uint32_t il, int32_t id,llama_pos target_pos);
