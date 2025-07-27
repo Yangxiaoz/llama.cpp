@@ -226,7 +226,6 @@ void custom_moe_unified::table_refresh(){
             // update table
             //TBD: need to careful rethink
             table.mark(il,id,expert_state::InMemory,0);
-
             // 标记已处理
             io_uring_cqe_seen(ring, cqe);
 
@@ -394,7 +393,7 @@ uint32_t custom_moe_unified::get_padding() const {
     return 32u;
 }
 
-void custom_moe_unified::load_data(llama_pos offset,uint32_t row, uint32_t col){
+void custom_moe_unified::load_data(llama_pos offset,uint32_t row, uint32_t col,io_mode mode){
 
     uint16_t    idx  = table.at(row,col).up.idx;
     GGML_ASSERT(table.at(row,col).gate.idx == idx && table.at(row,col).down.idx == idx);
@@ -404,18 +403,25 @@ void custom_moe_unified::load_data(llama_pos offset,uint32_t row, uint32_t col){
     size_t      down_offs = table.at(row,col).down.offs;
     //TBD: need create nbyte_expert vector  in (table_init)?;
     GGML_ASSERT(ggml_backend_buffer_is_host(pool.up->buffer));
-    async_io.block_read(static_cast<char*>(pool.up->data) + offset * nbyte_slot_up,nbyte_slot_up,up_offs);
-    async_io.block_read(static_cast<char*>(pool.gate->data) + offset * nbyte_slot_gate,nbyte_slot_gate,gate_offs);
-    async_io.block_read(static_cast<char*>(pool.down->data) + offset * nbyte_slot_down,nbyte_slot_down,down_offs);
+    if(mode == io_mode::block){
+        async_io.block_read(static_cast<char*>(pool.up->data) + offset * nbyte_slot_up,nbyte_slot_up,up_offs);
+        async_io.block_read(static_cast<char*>(pool.gate->data) + offset * nbyte_slot_gate,nbyte_slot_gate,gate_offs);
+        async_io.block_read(static_cast<char*>(pool.down->data) + offset * nbyte_slot_down,nbyte_slot_down,down_offs);
+    }else{
+        int index = row * table.col_size() + col;
+        async_io.async_submit(index,static_cast<char*>(pool.up->data) + offset * nbyte_slot_up,nbyte_slot_up,up_offs);
+    }
 }
 
 void custom_moe_unified::load_expert(uint32_t il, int32_t id,llama_pos target_pos,io_mode mode){
     if(mode == io_mode::block){//blocking load data
-        load_data(target_pos,il,id);
+        table.mark(il,id,expert_state::Loading,target_pos);
+        load_data(target_pos,il,id,mode);
         //update table
-        table.mark(il,id,expert_state::InMemory,target_pos);
+        table.mark(il,id,expert_state::InMemory,0);
     }else{
         //async submit data
+        
         GGML_ABORT("erro brance");
     }
 }
@@ -430,7 +436,7 @@ void custom_moe_unified::load_layer(uint32_t il, llama_pos target_pos,io_mode mo
     if(mode == io_mode::block){
         table.mark_layer(il,expert_state::Loading,target_pos);
         for(size_t i = 0; i < hparams.n_expert; i++){
-            load_data(target_pos + i,il,i);
+            load_data(target_pos + i,il,i,mode);
         }
         table.mark_layer(il,expert_state::InMemory,0);
     }else{

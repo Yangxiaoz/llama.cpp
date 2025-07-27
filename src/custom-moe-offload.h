@@ -278,7 +278,7 @@ private:
     //
     void        table_init(const llama_model & model,llama_model_loader & ml);
     uint32_t    get_padding() const;
-    void        load_data(llama_pos offset,uint32_t table_row, uint32_t table_col);
+    void        load_data(llama_pos offset,uint32_t table_row, uint32_t table_col,io_mode mode);
     void        load_expert(uint32_t il, int32_t id,llama_pos target_pos,io_mode mode);
     void        load_layer(uint32_t il, llama_pos target_pos,io_mode mode);
     void        free_expert(uint32_t il,int32_t id);
