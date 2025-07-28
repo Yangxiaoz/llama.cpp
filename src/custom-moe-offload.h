@@ -20,15 +20,17 @@
 #include <liburing.h> 
 
 
-#define M_PAD(x, n) (((x) + (n) - 1) & ~((n) - 1))
-#define MIN(a, b) ((a) < (b) ? (a) : (b))
-#define MAX(a, b) ((a) > (b) ? (a) : (b))
 #ifndef NDEBUG
     #define  CUSTOM_ASSERT(x)  GGML_ASSERT(x)
 #else
     #define  CUSTOM_ASSERT(x)  ((void)(x))
 #endif
+#define M_PAD(x, n) (((x) + (n) - 1) & ~((n) - 1))
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
 
+// #define PERF_TIME          
+//general
 #define NUM_EXPERT          3   //up gate down
 #define LAYER_HEAD          0  //mean the id of layer_head in table
 
@@ -37,9 +39,22 @@ struct llama_hparams;
 struct llama_model;
 struct llama_context;
 
+struct perf_time{
+    
+    std::array<int64_t, 27>         load_time;
+    std::array<int64_t, 27>         compute_time;
+    std::array<int64_t, 27>         compute_interval;
+};
+
 enum io_mode{
     block,
     async
+};
+//used for async read request
+struct ReadRequest {
+    char* buffer;      
+    size_t offset;     
+    uint32_t size;     
 };
 enum expert_state{
     OnDisk,
@@ -96,7 +111,7 @@ class custom_async_io{
     io_uring_params     params{};
     //func
     void block_read(char * buf, size_t size, size_t offset);
-    bool async_submit(int idx,char * buf,size_t size, size_t offset);
+    bool async_submit(int idx,const std::array<ReadRequest, 3>& requests);
     // void block_check();
 };
 
@@ -238,6 +253,7 @@ public:
     custom_moe_unified(const llama_model & model,float utilization,const std::string & fname,llama_model_loader & ml);
     ~custom_moe_unified() = default;
     //menbers
+    struct perf_time                            perf_t;
     std::unordered_map<std::string,uint32_t>    name_layer_map;   //mapping when runtime
     std::unique_ptr<custom_expert_manage>       manage;         //runtime management
     //
