@@ -8,9 +8,13 @@
 #include <cassert>
 #include <cmath>
 #include <limits>
-
+#include <fstream>
+#include <iostream>
 #include <condition_variable>
 
+
+// #include ""
+std::string extra_copyname(const std::string& str) ;
 
 void custom_async_io::block_read(char * buf, size_t size, size_t offset){
     // get sqe_handle
@@ -260,20 +264,6 @@ void custom_moe_unified::table_refresh(){
 
 void custom_moe_unified::check_layer(uint32_t il){
     auto state = table.layer_state.at(il);
-    // //
-    //prf time
-    static int flag = 1;
-#ifdef PERF_TIME
-    if(flag ==1){
-        perf_t.compute_time.at(il) = ggml_time_us();
-        if(il == 0){
-            perf_t.compute_interval.at(il) = 0;
-        }else{
-            perf_t.compute_interval.at(il) = perf_t.compute_time.at(il) - perf_t.compute_time.at(il -1);
-        }
-        if(il == 24)flag = 0;
-    }
-#endif
 
     if(state == expert_state::OnDisk){
         GGML_ASSERT(il > 0);//the first layer should always be activate
@@ -287,15 +277,11 @@ void custom_moe_unified::check_layer(uint32_t il){
         llama_pos pos = table.at(prev_il,LAYER_HEAD).pos;
         //free the prev_layer in table
         free_layer(prev_il);
-        #ifdef PERF_TIME
-        auto first = ggml_time_us();
-        #endif
+
         //load layer to pool
         load_layer(il,pos,io_mode::block);
         
-    #ifdef PERF_TIME 
-        perf_t.load_time.at(il) = ggml_time_us() - first;
-    #endif
+
     }else if(state == expert_state::Loading){
         GGML_ABORT("erro brance");
         //TBD: need to be impl
@@ -590,6 +576,16 @@ public:
         }
     }
 };
+//adjustment only of jetson nano
+std::string extra_copyname(const std::string& str) {
+    size_t first = str.find_first_of('#');
+    size_t second = str.find_first_of('#', first + 1);
+    
+    if (first != std::string::npos && second != std::string::npos) {
+        return str.substr(first + 1, second - first - 1);
+    }
+    return "";
+}
 
 // mapping the select_id to pos of pool
 void id_pos_map(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth,  void * userdata){
@@ -597,20 +593,24 @@ void id_pos_map(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith
     GGML_ASSERT(ggml_are_same_shape(dst, a));
     GGML_ASSERT(a->ne[2] == a->ne[3]);
     GGML_ASSERT(a->ne[2] == 1);
-
+    
     bool prefill = (a->ne[1] > 1);
     const int32_t       * a_data        = (int32_t *)ggml_get_data(a);
     int32_t             * dst_data      = (int32_t *)ggml_get_data(dst);
     custom_moe_unified  * moe_unified   = (custom_moe_unified *)userdata;
+    auto manage = moe_unified->manage.get();
 
     //get the tensor's index of layer
     std::string a_name(a->name);
     auto it = moe_unified->name_layer_map.find(a_name);
+    if(it == moe_unified->name_layer_map.end()){
+        it = moe_unified->name_layer_map.find(extra_copyname(a_name));
+    }
     GGML_ASSERT(it != moe_unified->name_layer_map.end());
     uint32_t il = it->second;
 
-    auto manage = moe_unified->manage.get();
-    
+    ////////////////////
+
     int n_ids   = a->ne[0];
     int n_token = a->ne[1];
     //wait to check layer state when prefill

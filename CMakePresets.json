@@ -9,7 +9,7 @@
           "cacheVariables": {
               "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
               "CMAKE_INSTALL_RPATH": "$ORIGIN;$ORIGIN/..",
-              "CMAKE_BUILD_PARALLEL_LEVEL": "14",
+              "CMAKE_BUILD_PARALLEL_LEVEL": "6",
               "GGML_CCACHE": "ON",
               "LLAMA_CURL": "OFF",
               "ENABLE_CUSTOM_MOE": "ON"
@@ -46,7 +46,8 @@
       { "name": "sycl_f16", "hidden": true, "cacheVariables": { "GGML_SYCL_F16":    "ON" } },
       { "name": "vulkan",   "hidden": true, "cacheVariables": { "GGML_VULKAN":      "ON" } },
       { "name": "aarch64_off","hidden": true, "cacheVariables": { "GGML_CPU_AARCH64": "OFF" } },
-      { "name": "cuda",       "hidden": true, "cacheVariables": { "GGML_CUDA":        "ON","CMAKE_CUDA_COMPILER": "/usr/local/cuda-12.2/bin/nvcc" } },
+      { "name": "cuda",       "hidden": true, "cacheVariables": { "GGML_CUDA":        "ON","CMAKE_CUDA_COMPILER": "/usr/local/cuda-12/bin/nvcc" } },
+      { "name": "jetson","hidden": true, "cacheVariables": { "CMAKE_CUDA_ARCHITECTURES": "87","GGML_CUDA_GRAPHS": "OFF" } },
       {
           "name": "x64-windows-llvm", "hidden": true,
           "cacheVariables": {
@@ -81,7 +82,8 @@
           }
       },
       { "name": "cpu-debug", "inherits": [ "linux-base","debug","aarch64_off" ] },
-      { "name": "cuda-debug", "inherits": [ "linux-base","debug","aarch64_off","cuda" ] },
+      { "name": "cuda-debug", "inherits": [ "linux-base","debug","cuda","aarch64_off","jetson" ] },
+      { "name": "cuda-test", "inherits": [ "linux-base","release","cuda","jetson" ] },
       { "name": "arm64-windows-llvm-debug", "inherits": [ "base", "arm64-windows-llvm", "debug" ] },
       { "name": "arm64-windows-llvm-release", "inherits": [ "base", "arm64-windows-llvm", "reldbg" ] },
       { "name": "arm64-windows-llvm+static-release", "inherits": [ "base", "arm64-windows-llvm", "reldbg", "static" ] },

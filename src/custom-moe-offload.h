@@ -29,7 +29,6 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
-// #define PERF_TIME          
 //general
 #define NUM_EXPERT          3   //up gate down
 #define LAYER_HEAD          0  //mean the id of layer_head in table
@@ -40,10 +39,9 @@ struct llama_model;
 struct llama_context;
 
 struct perf_time{
-    
+    int il;
     std::array<int64_t, 27>         load_time;
     std::array<int64_t, 27>         compute_time;
-    std::array<int64_t, 27>         compute_interval;
 };
 
 enum io_mode{
@@ -253,7 +251,7 @@ public:
     custom_moe_unified(const llama_model & model,float utilization,const std::string & fname,llama_model_loader & ml);
     ~custom_moe_unified() = default;
     //menbers
-    struct perf_time                            perf_t;
+    std::vector<struct perf_time>               perf_t;
     std::unordered_map<std::string,uint32_t>    name_layer_map;   //mapping when runtime
     std::unique_ptr<custom_expert_manage>       manage;         //runtime management
     //
