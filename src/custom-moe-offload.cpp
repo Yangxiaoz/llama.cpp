@@ -46,54 +46,112 @@ void custom_async_io::block_read(char * buf, size_t size, size_t offset){
     }
 }
 
-bool custom_async_io::async_submit(int idx,const std::array<ReadRequest, 3>& requests){
+bool custom_async_io::async_submit(int idx,char * buf, size_t size, size_t offset){
+    if (idx == 0) {
+        fprintf(stderr, "<async_submit>Error: idx cannot be 0\n");
+        return false;
+    }
     // first
-    struct io_uring_sqe* sqe;
-    sqe = io_uring_get_sqe(&ring);
-    if (!sqe) {
-        fprintf(stderr, "Error: could not get SQE for the 1st request.\n");
-        return false;
-    }
-    const auto& req1 = requests[0];
-    io_uring_prep_read(sqe, 0, req1.buffer, req1.size, req1.offset);
-    sqe->flags |= IOSQE_FIXED_FILE;
-    sqe->flags |= IOSQE_IO_LINK;
-    //second
-    sqe = io_uring_get_sqe(&ring);
-    if (!sqe) {
-        fprintf(stderr, "Error: could not get SQE for the 2nd request.\n");
-        return false;
-    }
-    const auto& req2 = requests[1];
-    io_uring_prep_read(sqe, 0, req2.buffer, req2.size, req2.offset);
-    sqe->flags |= IOSQE_FIXED_FILE;
-    sqe->flags |= IOSQE_IO_LINK;
-    //third
-    sqe = io_uring_get_sqe(&ring);
-    if (!sqe) {
-        fprintf(stderr, "Error: could not get SQE for the 3nd request.\n");
-        return false;
-    }
-    const auto& req3 = requests[2];
-    io_uring_prep_read(sqe, 0, req3.buffer, req3.size, req3.offset);
+    struct io_uring_sqe* sqe  = io_uring_get_sqe(&ring);
+    if (!sqe) return false; 
+    io_uring_prep_read(sqe, 0, buf, size, offset);//0: the index of register file
     sqe->flags |= IOSQE_FIXED_FILE;
     sqe->user_data = idx;
-
     // 提交请求
     int ret = io_uring_submit(&ring);
     if (ret < 0) {
         fprintf(stderr, "erro sqe submit\n");
         return false;
     }
+
     return true;
 }
+    // const auto& req1 = requests[0];
+    // io_uring_prep_read(sqe, 0, req1.buffer, req1.size, req1.offset);
+    // sqe->flags |= IOSQE_FIXED_FILE;
+    // sqe->flags |= (IOSQE_IO_LINK );
+    // sqe->user_data = 0;
+    // //second
+    // sqe = io_uring_get_sqe(&ring);
+    // if (!sqe) return false; 
+    // const auto& req2 = requests[1];
+    // io_uring_prep_read(sqe, 0, req2.buffer, req2.size, req2.offset);
+    // sqe->flags |= IOSQE_FIXED_FILE;
+    // sqe->flags |= IOSQE_IO_LINK;
+    // sqe->user_data = 0;
+    // //third
+    // sqe = io_uring_get_sqe(&ring);
+    // if (!sqe) return false; 
+    // const auto& req3 = requests[2];
+    // io_uring_prep_read(sqe, 0, req3.buffer, req3.size, req3.offset);
+    // sqe->flags |= IOSQE_FIXED_FILE;
+    // sqe->user_data = idx;
+
+    // // 提交请求
+    // int ret = io_uring_submit(&ring);
+    // if (ret < 0) {
+    //     fprintf(stderr, "erro sqe submit\n");
+    //     return false;
+    // }
+
+    // return true;
+
+
+// ==========================================
+    // 新增方法 1: 刷新函数 (非阻塞)
+    // 检查并处理所有当前已完成的请求
+    // ==========================================
+std::vector<uint32_t> custom_async_io::refresh_completions() {
+    struct io_uring_cqe* cqe;
+    std::vector<uint32_t> completed_ids;
+
+    while (io_uring_peek_cqe(&ring, &cqe) == 0) {
+        // 获取到了一个 cqe
+        uint32_t id = process_cqe(cqe); // 内部调用 seen，移动队列指针
+        completed_ids.push_back(id);
+    }
+    return completed_ids;   
+}
+
+// ==========================================
+// 新增方法 2: 阻塞等待特定请求
+// ==========================================
+// void custom_async_io::wait_for_request(int target_idx) {
+    // 1. 如果ID不存在或已经是完成状态，直接返回
+    // auto it = request_status_map_.find(target_idx);
+    // if (it == request_status_map_.end()|| it->second == request_status::FAILED) {
+    //     throw std::runtime_error("ERRO request idx not found or already failed");
+    // }
+    // if (it->second == request_status::COMPLETED ) {
+    //     return;
+    // }
+
+    // // 2. 循环等待，直到目标 idx 变成完成状态
+    // struct io_uring_cqe* cqe;
+    // while (request_status_map_[target_idx] == request_status::LOADING) {
+    //     // io_uring_wait_cqe 会阻塞，直到至少有一个事件完成
+    //     int ret = io_uring_wait_cqe(&ring, &cqe);
+        
+    //     if (ret < 0) {
+    //         throw std::runtime_error("Wait CQE failed: " + std::string(strerror(-ret)));
+    //     }
+    //     process_cqe(cqe);
+    // }
+    
+    // // 循环结束意味着 target_idx 的状态变了
+    // if (request_status_map_[target_idx] == request_status::FAILED) {
+    //         throw std::runtime_error("Target request failed during wait");
+    // }
+// }
 
 custom_expert_table::custom_expert_table(uint32_t n_moe_layer, uint32_t n_expert)
     :n_row(n_moe_layer), 
      n_col(n_expert),
+     load_ctx(n_moe_layer, LoadContext(n_expert)),
      experts(n_moe_layer,std::vector<custom_expert_group>(n_expert)),
-     layer_type(n_moe_layer),
-     layer_state(n_moe_layer,OnDisk){}
+     layer_type(n_moe_layer)
+    {}
+
 
 
 custom_expert_manage::custom_expert_manage(custom_expert_table& table,custom_expert_pool& pool):table(table),pool(pool){
@@ -238,41 +296,53 @@ void custom_moe_unified::prefill_init(){
     LLAMA_LOG_INFO("custom_moe prefill init: %d layers have been pre-load",n_layer_load);
 }
 
-void custom_moe_unified::table_refresh(){
-    io_uring*  ring = &async_io.ring;     
-    struct io_uring_cqe* cqe;
+// void custom_moe_unified::table_refresh(){
+//     io_uring*  ring = &async_io.ring;     
+//     struct io_uring_cqe* cqe;
 
-    while (io_uring_peek_cqe(ring, &cqe) == 0)
-    {
-        if(cqe->res < 0){
-            throw std::runtime_error("Read failed: " + std::string(strerror(-cqe->res)));
-        }else{
-            int request_id = static_cast<int>(cqe->user_data);
-            int il = request_id / 64;
-            int id = request_id % 64;
-            // update table
-            //TBD: need to careful rethink
-            GGML_ASSERT(table.at(il,id).state == expert_state::Loading);
-            table.mark(il,id,expert_state::InMemory,0);
-            // 标记已处理
-            io_uring_cqe_seen(ring, cqe);
+//     while (io_uring_peek_cqe(ring, &cqe) == 0)
+//     {
+//         if(cqe->res < 0){
+//             throw std::runtime_error("Read failed: " + std::string(strerror(-cqe->res)));
+//         }else{
+//             int request_id = static_cast<int>(cqe->user_data);
+//             int il = request_id / 64;
+//             int id = request_id % 64;
+//             // update table
+//             //TBD: need to careful rethink
+//             GGML_ASSERT(table.at(il,id).state == expert_state::Loading);
+//             table.mark(il,id,expert_state::InMemory,0);
+//             // 标记已处理
+//             io_uring_cqe_seen(ring, cqe);
 
-        }
+//         }
         
-    }
-}                                  
+//     }
+// }                                  
 
 void custom_moe_unified::check_layer(uint32_t il){
-    auto state = table.layer_state.at(il);
+    
+    if(table.layer_check(il)){
+        return;
+    }
+    if(table.is_layer_trigger(il)){//the layer load has been triggered
+        //wait for loading complete
+        while(table.layer_check(il) == false){
+            table.refresh(async_io);
+        }
+        //layer load complete
+        //mark all expert in layer as expertstate::InMemory
+        table.mark_layer(il,expert_state::InMemory,INVALID_POS);
+        return;
 
-    if(state == expert_state::OnDisk){
+    }else{// no trigger yet
+        //blocking load the layer now 
         GGML_ASSERT(il > 0);//the first layer should always be activate
         uint32_t prev_il = il -1;
 
         //TEMP: tempprary implementation 
         //always use the pool of prev layer to load cur layer of weight
-        
-        GGML_ASSERT(table.layer_state.at(prev_il) = expert_state::InMemory);
+        GGML_ASSERT(table.layer_check(prev_il) == true);
         //Reuse the pool of prev_layer for cur_layer
         llama_pos pos = table.at(prev_il,LAYER_HEAD).pos;
         //free the prev_layer in table
@@ -280,11 +350,6 @@ void custom_moe_unified::check_layer(uint32_t il){
 
         //load layer to pool
         load_layer(il,pos,io_mode::block);
-        
-
-    }else if(state == expert_state::Loading){
-        GGML_ABORT("erro brance");
-        //TBD: need to be impl
     }
 }
 
@@ -308,8 +373,12 @@ void custom_moe_unified::check_expert(uint32_t il,uint32_t id){
         }  
         load_expert(il,id,pos,io_mode::block);
     }else if(state == expert_state::Loading){
-        GGML_ABORT("erro brance");
-        //TBD: need to be impl
+        while(1){
+            table.refresh(async_io);
+            if(table.at(il,id).state == expert_state::InMemory){
+                return;
+            }
+        }
     }
 }
 //mapping the select_id to pos of pool
@@ -424,42 +493,25 @@ uint32_t custom_moe_unified::get_padding() const {
     return 32u;
 }
 
-void custom_moe_unified::load_data(llama_pos offset,uint32_t row, uint32_t col,io_mode mode){
 
-    uint16_t    idx  = table.at(row,col).up.idx;
-    GGML_ASSERT(table.at(row,col).gate.idx == idx && table.at(row,col).down.idx == idx);
-
-    size_t      up_offs = table.at(row,col).up.offs;
-    size_t      gate_offs = table.at(row,col).gate.offs;
-    size_t      down_offs = table.at(row,col).down.offs;
-    GGML_ASSERT(ggml_backend_buffer_is_host(pool.up->buffer));
-    if(mode == io_mode::block){
-        //blocking data load
-        async_io.block_read(static_cast<char*>(pool.up->data) + offset * nbyte_slot_up,nbyte_slot_up,up_offs);
-        async_io.block_read(static_cast<char*>(pool.gate->data) + offset * nbyte_slot_gate,nbyte_slot_gate,gate_offs);
-        async_io.block_read(static_cast<char*>(pool.down->data) + offset * nbyte_slot_down,nbyte_slot_down,down_offs);
-    }else{
-        //async data load
-        int index = row * table.col_size() + col;
-        std::array<ReadRequest, 3> group_requests = {{
-            {static_cast<char*>(pool.up->data) + offset * nbyte_slot_up, up_offs, nbyte_slot_up},
-            {static_cast<char*>(pool.gate->data) + offset * nbyte_slot_gate, gate_offs, nbyte_slot_gate},
-            {static_cast<char*>(pool.down->data) + offset * nbyte_slot_down, down_offs, nbyte_slot_down}
-        }};
-        async_io.async_submit(index,group_requests);
-    }
-}
 
 void custom_moe_unified::load_expert(uint32_t il, int32_t id,llama_pos target_pos,io_mode mode){
-    if(mode == io_mode::block){//blocking load data
-        table.mark(il,id,expert_state::Loading,target_pos);
-        load_data(target_pos,il,id,mode);
-        //update table immediately
-        table.mark(il,id,expert_state::InMemory,0);
-    }else{
-        //async submit data
-        
-        GGML_ABORT("erro brance");
+    table.mark(il,id,expert_state::Loading,target_pos);
+    //load data
+        //io::block
+    if(mode == io_mode::block){
+        async_io.block_read(static_cast<char*>(pool.up->data)   + target_pos * nbyte_slot_up,     nbyte_slot_up,      table.at(il,id).up.offs);
+        async_io.block_read(static_cast<char*>(pool.gate->data) + target_pos * nbyte_slot_gate,   nbyte_slot_gate,    table.at(il,id).gate.offs);
+        async_io.block_read(static_cast<char*>(pool.down->data) + target_pos * nbyte_slot_down,   nbyte_slot_down,    table.at(il,id).down.offs);
+
+        table.mark(il,id,expert_state::InMemory,INVALID_POS);// and, the pos of table.mark()(aka '0') is meaningless
+    }else{//io::async
+
+        //submit async read
+        int identity_index = table.map(il,id);
+        async_io.async_submit(identity_index,static_cast<char*>(pool.up->data)   + target_pos * nbyte_slot_up,   nbyte_slot_up,   table.at(il,id).up.offs);
+        async_io.async_submit(identity_index,static_cast<char*>(pool.gate->data) + target_pos * nbyte_slot_gate, nbyte_slot_gate, table.at(il,id).gate.offs);
+        async_io.async_submit(identity_index,static_cast<char*>(pool.down->data) + target_pos * nbyte_slot_down, nbyte_slot_down, table.at(il,id).down.offs);
     }
 }
 
@@ -470,26 +522,50 @@ input:
     target_pos: the pos of pool load to
 */
 void custom_moe_unified::load_layer(uint32_t il, llama_pos target_pos,io_mode mode){
+    table.mark_layer(il,expert_state::Loading,target_pos);
+    //load data
+        //io::block
     if(mode == io_mode::block){
-        table.mark_layer(il,expert_state::Loading,target_pos);
-        for(size_t i = 0; i < hparams.n_expert; i++){
-            load_data(target_pos + i,il,i,mode);
+        //up
+        for(int32_t id = 0; id < static_cast<int32_t>(hparams.n_expert); id++){
+            async_io.block_read(static_cast<char*>(pool.up->data)   + (target_pos + id) * nbyte_slot_up,     nbyte_slot_up,      table.at(il,id).up.offs);
         }
-        table.mark_layer(il,expert_state::InMemory,0);
-    }else{
-        //async submit
-        GGML_ABORT("erro brance");
+        //gate
+        for(int32_t id = 0; id < static_cast<int32_t>(hparams.n_expert); id++){
+            async_io.block_read(static_cast<char*>(pool.gate->data) + (target_pos + id) * nbyte_slot_gate,   nbyte_slot_gate,    table.at(il,id).gate.offs);
+        }
+        //down
+        for(int32_t id = 0; id < static_cast<int32_t>(hparams.n_expert); id++){
+            async_io.block_read(static_cast<char*>(pool.down->data) + (target_pos + id) * nbyte_slot_down,   nbyte_slot_down,    table.at(il,id).down.offs);
+        }
+        table.mark_layer(il,expert_state::InMemory,INVALID_POS);
+    }else{//io::async        
+        for(int32_t id = 0; id < static_cast<int32_t>(hparams.n_expert); id++){
+            int identity_index = table.map(il,id);
+            async_io.async_submit(identity_index,static_cast<char*>(pool.up->data)   + (target_pos + id) * nbyte_slot_up,   nbyte_slot_up,   table.at(il,id).up.offs);
+        };
+        for(int32_t id = 0; id < static_cast<int32_t>(hparams.n_expert); id++){
+            int identity_index = table.map(il,id);
+            async_io.async_submit(identity_index,static_cast<char*>(pool.gate->data) + (target_pos + id) * nbyte_slot_gate, nbyte_slot_gate, table.at(il,id).gate.offs);
+        };
+        for(int32_t id = 0; id < static_cast<int32_t>(hparams.n_expert); id++){
+            int identity_index = table.map(il,id);
+            async_io.async_submit(identity_index,static_cast<char*>(pool.down->data) + (target_pos + id) * nbyte_slot_down, nbyte_slot_down, table.at(il,id).down.offs);
+        };
     }
     //update mange
+    //TODO: to check this func if nessesary
     manage.get()->active_layer(il);
+    //TODO: end
+
 }
 
 void custom_moe_unified::free_expert(uint32_t il,int32_t id){
-    table.mark(il,id,expert_state::OnDisk,-1);
+    table.mark(il,id,expert_state::OnDisk,INVALID_POS);
     manage.get()->erase(il,id);
 }
 void custom_moe_unified::free_layer(uint32_t il){
-    table.mark_layer(il,expert_state::OnDisk,-1);
+    table.mark_layer(il,expert_state::OnDisk,INVALID_POS);
     manage.get()->erase_layer(il);
 }
 /* 

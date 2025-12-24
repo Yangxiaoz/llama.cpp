@@ -30,13 +30,37 @@
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
 //general
-#define NUM_EXPERT          3   //up gate down
+#define NUM_EXPERT          3   //up、gate、down
 #define LAYER_HEAD          0  //mean the id of layer_head in table
-
-
+#define TABLE_SHIFT         0  //the id of table shift in table
+#define INVALID_POS        -1
 struct llama_hparams;
 struct llama_model;
 struct llama_context;
+
+enum class io_mode{
+    block,
+    async
+};
+
+
+// enum class request_status {
+//     NOT_FOUND, 
+//     LOADING,   
+//     COMPLETED, 
+//     FAILED    
+// };
+
+enum class expert_state{
+    OnDisk,
+    Loading,
+    InMemory
+};
+
+enum class active_type{
+    Layer,
+    Expert
+};
 
 struct perf_time{
     int il;
@@ -44,21 +68,14 @@ struct perf_time{
     std::array<int64_t, 27>         compute_time;
 };
 
-enum io_mode{
-    block,
-    async
-};
+
 //used for async read request
-struct ReadRequest {
-    char* buffer;      
-    size_t offset;     
-    uint32_t size;     
-};
-enum expert_state{
-    OnDisk,
-    Loading,
-    InMemory
-};
+// struct ReadRequest {
+//     char* buffer;      
+//     uint32_t size;     
+//     size_t offset;     
+// };
+
 struct custom_tensor_mmap{
     uint16_t idx;
     size_t offs;
@@ -83,9 +100,28 @@ struct custom_expert_pool{
 class custom_async_io{
     private:
     int                 fd;
+    io_uring            ring;
+    io_uring_params     params{};
+    // 状态表：key 是 idx (user_data), value 是当前状态
+    // std::unordered_map<int, request_status> request_status_map_;
+
+    //update the signal of cqe to request status map
+    uint32_t process_cqe(struct io_uring_cqe* cqe) {
+        uint64_t id = cqe->user_data;
+        if (cqe->res < 0) {
+            int err = -cqe->res;
+            throw std::runtime_error(
+                std::string("async I/O error: ") + strerror(err)
+            );
+        }
+        // 标记该 CQE 已处理
+        io_uring_cqe_seen(&ring, cqe);
+        return static_cast<uint32_t>(id);
+        }
+
     public:
 
-    custom_async_io(const std::string & fname,int queue_depth = 512){
+    custom_async_io(const std::string & fname,int queue_depth = 640){
         //no params is no used yet
         int ret = io_uring_queue_init_params(queue_depth, &ring, &params);
         if (ret < 0) {
@@ -104,19 +140,68 @@ class custom_async_io{
         io_uring_queue_exit(&ring);
         close(fd);
     }
-    //menbers
-    io_uring            ring;
-    io_uring_params     params{};
+
     //func
     void block_read(char * buf, size_t size, size_t offset);
-    bool async_submit(int idx,const std::array<ReadRequest, 3>& requests);
+    bool async_submit(int idx,char * buf, size_t size, size_t offset);
+    std::vector<uint32_t> refresh_completions();
+    // void wait_for_request(int target_idx); //no used now
     // void block_check();
+};
+
+
+struct LoadContext {
+    bool is_finished;
+    bool is_started;
+    const size_t n_expert; // 动态的 expert 数量
+    size_t finished_expert_count; // 已完成的 expert 数量
+    std::vector<uint8_t> pending_io; // 每个 expert 剩余的 IO 请求数
+
+
+    explicit LoadContext(size_t n_expert) 
+        : is_finished(false),
+          is_started(false),
+          n_expert(n_expert),
+          finished_expert_count(0),
+          pending_io(n_expert) // 初始化 vector 大小
+    {
+        for (size_t i = 0; i < n_expert; ++i) {
+            pending_io[i] = 3; // 每个 expert 有 3 个权重块
+        }
+    }
+
+    bool is_layer_started() const {
+        return is_started;
+    }
+    bool is_layer_finished() const {
+        return is_finished;
+    }
+
+    /* return true if the expert is finished */
+    bool transfor_complete(size_t expert_idx) {
+        GGML_ASSERT(expert_idx < n_expert && "expert_idx out of bounds");
+  
+        // 原子减少 pending_io 计数
+        pending_io[expert_idx] = pending_io[expert_idx] - 1;
+        uint8_t cur_count = pending_io[expert_idx];
+        
+        if (cur_count == 0) {
+            finished_expert_count += 1;
+            pending_io[expert_idx] = 3; // 重置为 3，准备下一次加载
+            return true; // 该 expert 刚完成
+        }
+        if (finished_expert_count == n_expert) {
+            is_finished = true;
+        }
+        return false;
+    }
 };
 
 class custom_expert_table{
 private:
     uint32_t n_row;
     int32_t n_col;
+    std::vector<struct LoadContext>                 load_ctx;//for async load management
     //func:
     void check_indices(uint32_t row, int32_t col) const {
         GGML_ASSERT((row < n_row)&& (0 <= col)&& (col < n_col) && "expert_table index out of bounds");
@@ -127,8 +212,7 @@ public:
 //members
     std::vector<std::vector<custom_expert_group>>   experts;
     std::vector<std::array<ggml_type, NUM_EXPERT>>  layer_type; //up gate down
-    std::vector<expert_state>                       layer_state;//used for layer_check when prefill
-
+    
 // func
     custom_expert_group& at(uint32_t row, int32_t col){
         check_indices(row,col);
@@ -140,39 +224,83 @@ public:
         return experts[row][col].pos; 
     }
 
-    void set_pos(uint32_t row, int32_t col, llama_pos id){
-        check_indices(row,col);
-        experts[row][col].pos = id;
-    }
-
     void mark(uint32_t row, int32_t col, expert_state state, llama_pos pos){
+    //note: when the state is InMemory, the pos is no used
         check_indices(row,col);
         if(state == expert_state::OnDisk){
             experts[row][col].pos   = -1;
         } else if(state == expert_state::Loading){
             experts[row][col].pos   = pos;
+        }else if(state == expert_state::InMemory){
+            // Do nothing with pos
         }
         experts[row][col].state = state;
     }
-    //note:
-    //when use the mark_layer, there is no need to set expert_state to 'Loading',but set it directly to 'InMemory'
-    //Due to In layer mode,we check the <vector> layer_state instead of expert_state.
+
     void mark_layer(uint32_t row, expert_state state, llama_pos head_pos){
         check_indices(row,0);
         if(state == expert_state::OnDisk){
             for(int32_t i =0; i < n_col; i++){
                 experts[row][i].pos = -1;
-                experts[row][i].state = state;
+                experts[row][i].state = expert_state::OnDisk;
             }
         } else if(state == expert_state::Loading){
             for(int32_t i =0; i < n_col; i++){
                 experts[row][i].pos = head_pos + i;
+                //layer load no need to set the pos of each expert for loading
+                // experts[row][i].state = expert_state::Loading;
+            }
+            load_ctx.at(row).is_started = true; 
+        }
+        else if(state == expert_state::InMemory){
+            for(int32_t i =0; i < n_col; i++){
                 experts[row][i].state = expert_state::InMemory;
             }
+            load_ctx.at(row).is_finished = true;
+            load_ctx.at(row).is_started = false;
         }
-        layer_state[row] = state;
+        
     }
 
+    int map(int row, int col) const{
+        check_indices(row,col);
+        return row * n_col + col + TABLE_SHIFT;
+    }
+
+    std::pair<int, int> unmap(int id) const {
+        const int x = id - TABLE_SHIFT; 
+        const int row = x / n_col;
+        const int col = x % n_col;
+
+        check_indices(row, col); 
+        return {row, col};
+    }
+
+    bool layer_check(int il) const{
+        GGML_ASSERT((il >= 0)&& (il < static_cast<int>(n_row)) && "expert_table layer_check index out of bounds");
+        return load_ctx.at(il).is_layer_finished();
+    }
+
+    /* return true if the layer is started */
+    bool is_layer_trigger(int il) const{
+        GGML_ASSERT((il >= 0)&& (il < static_cast<int>(n_row)) && "expert_table layer_check index out of bounds");
+        return load_ctx.at(il).is_layer_started();
+    }
+    
+    void refresh(class custom_async_io& async_io){
+        auto compelete_ids = async_io.refresh_completions();
+        for (auto data_id : compelete_ids) {
+            //get il and expert_id from id
+            auto [layer_id, expert_id] = unmap(data_id);
+            auto is_complete = load_ctx.at(layer_id).transfor_complete(expert_id);
+            if(is_complete){
+                //layer load complete
+                //mark all expert in layer as expertstate::InMemory
+                mark_layer(layer_id,expert_state::InMemory,INVALID_POS);
+            }
+        }
+    }
+    
     uint32_t row_size(){
         return n_row;
     }
@@ -197,8 +325,8 @@ private:
     };
     custom_expert_table&                                            table;
     custom_expert_pool&                                             pool;
-    std::vector<std::set<ActiveUnit>>                               active_set;
-    std::unordered_map<int, std::unordered_map<int, ActiveUnit>>    active_map;                
+    std::vector<std::set<ActiveUnit>>                               active_set;// a set for indicate the active experts in each layer
+    std::unordered_map<int, std::unordered_map<int, ActiveUnit>>    active_map;//for quick access the unit according to (layer_id,expert_id)                
 
 public: 
     custom_expert_manage(custom_expert_table& table,custom_expert_pool& pool);
@@ -259,7 +387,7 @@ public:
     //
     uint32_t                                total_size() const;
     void                                    prefill_init();//pre-load the initial some layer of moe_weight
-    void                                    table_refresh();//refresh the table status due to async transmission
+    // void                                    table_refresh();//no need now
     void                                    check_layer(uint32_t il);
     void                                    check_expert(uint32_t il,uint32_t id);
     llama_pos                               id_map(uint32_t il, int32_t selec_id);
@@ -292,7 +420,8 @@ private:
     //
     void        table_init(const llama_model & model,llama_model_loader & ml);
     uint32_t    get_padding() const;
-    void        load_data(llama_pos offset,uint32_t table_row, uint32_t table_col,io_mode mode);
+    // void        load_data(llama_pos offset,uint32_t table_row, uint32_t table_col,active_type type,io_mode mode);// no need now
+    //
     void        load_expert(uint32_t il, int32_t id,llama_pos target_pos,io_mode mode);
     void        load_layer(uint32_t il, llama_pos target_pos,io_mode mode);
     void        free_expert(uint32_t il,int32_t id);
