@@ -18,8 +18,8 @@ int main(int argc, char ** argv) {
     // number of layers to offload to the GPU
     int ngl = 99;
     // number of tokens to predict
-    int n_predict = 32;
-
+    int n_predict = 99;
+    bool optimizations = false;
     // parse command line arguments
 
     {
@@ -36,6 +36,20 @@ int main(int argc, char ** argv) {
                 if (i + 1 < argc) {
                     try {
                         n_predict = std::stoi(argv[++i]);
+                    } catch (...) {
+                        print_usage(argc, argv);
+                        return 1;
+                    }
+                } else {
+                    print_usage(argc, argv);
+                    return 1;
+                }
+            } else if (strcmp(argv[i], "-opt") == 0) {
+                if (i + 1 < argc) {
+                    try {
+                        if(std::stoi(argv[++i])){
+                            optimizations = true;
+                        }
                     } catch (...) {
                         print_usage(argc, argv);
                         return 1;
@@ -83,7 +97,9 @@ int main(int argc, char ** argv) {
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = ngl;
 #ifdef CUSTOM_MOE
-    model_params.moe_memory_utilization = (float) 0.5;
+    model_params.moe_memory_utilization = (float) 0.46;
+    model_params.moe_enable_optimizations = optimizations;
+
 #endif
     model_params.use_mmap = false;// mmap will map all file or weight
 

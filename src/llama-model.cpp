@@ -12462,10 +12462,19 @@ struct llm_build_deepseek2 : public llm_graph_context {
             } else {
                 // MoE branch
             #ifdef CUSTOM_MOE
+                ggml_tensor * predict = nullptr;
+                ggml_tensor * predict_probs_b = nullptr;
+                if((model.moe_unified->params.optimization) && ((uint32_t)il < hparams.n_layer-1)) {
+                predict = model.layers[il + 1].ffn_gate_inp;
+                predict_probs_b = model.layers[il + 1].ffn_exp_probs_b;
+                }
+
                 ggml_tensor * moe_out =
                     build_moe_ffn_offload(gf,cur,
                             model.layers[il].ffn_gate_inp,
                             model.layers[il].ffn_exp_probs_b,
+                            predict,
+                            predict_probs_b,
                             model.moe_unified.get(),
                             n_expert, n_expert_used,
                             LLM_FFN_SILU, hparams.expert_weights_norm,
@@ -17531,6 +17540,7 @@ llama_model_params llama_model_default_params() {
         /*.kv_overrides                =*/ nullptr,
 #ifdef CUSTOM_MOE
         /*.moe_memory_utilization      =*/(float)0.3,
+        /*.moe_enable_optimizations    =*/ false,
 #endif
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,

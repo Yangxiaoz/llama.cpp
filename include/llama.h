@@ -284,6 +284,7 @@ extern "C" {
         const struct llama_model_kv_override * kv_overrides;
 #ifdef CUSTOM_MOE
         float moe_memory_utilization;
+        bool  moe_enable_optimizations;
 #endif
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;    // only load the vocabulary, no weights

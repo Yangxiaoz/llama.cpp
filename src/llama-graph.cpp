@@ -549,11 +549,70 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
 
 #ifdef CUSTOM_MOE
 //build_moe_ffn_offload
+ggml_tensor * llm_graph_context::build_moe_ffn_predict(
+         ggml_cgraph * gf,
+         ggml_tensor * cur,
+         ggml_tensor * predict_inp,//1
+         ggml_tensor * exp_probs_b,//1
+  custom_moe_unified * moe_unified,
+             int64_t   n_expert_used,
+         llama_expert_gating_func_type gating_op,//1
+                int   il) const {
+    //CUSTOM_MOE func
+    // const int64_t n_embd   = cur->ne[0];
+    // const int64_t n_tokens = cur->ne[1];
+
+
+    ggml_tensor * logits = build_lora_mm(predict_inp, cur); // [n_expert, n_tokens]
+    cb(logits, "moe_predict_logits", il);
+
+    ggml_tensor * probs = nullptr;
+    switch (gating_op) {
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:
+            {
+                probs = ggml_soft_max(ctx0, logits); // [n_expert, n_tokens]
+            } break;
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID:
+            {
+                probs = ggml_sigmoid(ctx0, logits); // [n_expert, n_tokens]
+            } break;
+        default:
+            GGML_ABORT("fatal error");
+    }
+    cb(probs, "moe_predict_probs", il);
+
+    // add experts selection bias - introduced in DeepSeek V3
+    // leave probs unbiased as it's later used to get expert weights
+    ggml_tensor * selection_probs = probs;
+    if (exp_probs_b != nullptr) {
+        selection_probs = ggml_add(ctx0, probs, exp_probs_b);
+        cb(selection_probs, "moe_predict_probs_biased", il);
+    }
+
+
+    // select experts
+    ggml_tensor * selected_experts = ggml_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
+    cb(selected_experts->src[0], "moe_predict_argsort", il);
+    cb(selected_experts, "moe_predict_topk", il);
+    ggml_build_forward_expand(gf, selected_experts);
+
+    //operator defined by customer  
+    runtime_ctx* custom_ctx = new runtime_ctx;
+    custom_ctx->moe_unified = moe_unified;
+    custom_ctx->il       = il - hparams.n_layer_dense_lead;
+    ggml_tensor * none = ggml_map_custom1_inplace(ctx0, selected_experts, custom_predict, 1, custom_ctx);
+    cb(none, "moe_predict_none", il);
+    ggml_build_forward_expand(gf, none);
+    return none;
+}
+
 ggml_tensor * llm_graph_context::build_moe_ffn_offload(
          ggml_cgraph * gf,
          ggml_tensor * cur,
          ggml_tensor * gate_inp,
          ggml_tensor * exp_probs_b,
+         ggml_tensor * predict_inp,
+         ggml_tensor * predict_probs_b,
   custom_moe_unified * moe_unified,
              int64_t   n_expert,
              int64_t   n_expert_used,
@@ -606,20 +665,59 @@ ggml_tensor * llm_graph_context::build_moe_ffn_offload(
     cb(selected_experts, "ffn_moe_topk", il);
     ggml_build_forward_expand(gf, selected_experts);
 
-    // record the <select_name,index_layer> in a map
-    moe_unified->name_layer_map.emplace(selected_experts->name,il - hparams.n_layer_dense_lead);
     //operator defined by customer  
-    ggml_tensor * select_map = ggml_map_custom1(ctx0, selected_experts, id_pos_map, 1, moe_unified);
+    runtime_ctx* custom_ctx = new runtime_ctx;
+    custom_ctx->moe_unified = moe_unified;
+    custom_ctx->il       = il - hparams.n_layer_dense_lead;
+    ggml_tensor * select_map = ggml_map_custom1(ctx0, selected_experts, id_pos_map, 1, custom_ctx);
     cb(select_map, "moe_topk_pos", il);
     ggml_build_forward_expand(gf, select_map);
-    //ctx0 size?
-    //TBD:  x 1. how to get select_map?
-    //          x a. check layer_status of selected_experts_id's status
-    //          x b. load action and synch to wait
-    //          x c. predic_build expand preserve(predic_async?)
-    //        2. how to reshape moe_pool to 3D shape？
-    //        3. deal with pool_alloc fault (sched)
+
+    //predict
+/////////
+
+    if (moe_unified->params.optimization && predict_inp != nullptr){
+        ggml_tensor * logits = build_lora_mm(predict_inp, cur); // [n_expert, n_tokens]
+        cb(logits, "moe_predict_logits", il);
     
+        ggml_tensor * predict_probs = nullptr;
+        switch (gating_op) {
+            case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:
+                {
+                    predict_probs = ggml_soft_max(ctx0, logits); // [n_expert, n_tokens]
+                } break;
+            case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID:
+                {
+                    predict_probs = ggml_sigmoid(ctx0, logits); // [n_expert, n_tokens]
+                } break;
+            default:
+                GGML_ABORT("fatal error");
+        }
+        cb(predict_probs, "moe_predict_probs", il);
+    
+        // add experts selection bias - introduced in DeepSeek V3
+        // leave probs unbiased as it's later used to get expert weights
+        ggml_tensor * selection_probs = predict_probs;
+        if (predict_probs_b != nullptr) {
+            selection_probs = ggml_add(ctx0, predict_probs, predict_probs_b);
+            cb(selection_probs, "moe_predict_probs_biased", il);
+        }
+            // select experts
+        ggml_tensor * selected_experts = ggml_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
+        cb(selected_experts->src[0], "moe_predict_argsort", il);
+        cb(selected_experts, "moe_predict_topk", il);
+        ggml_build_forward_expand(gf, selected_experts);
+        runtime_ctx* custom_ctx = new runtime_ctx;
+        custom_ctx->moe_unified = moe_unified;
+        custom_ctx->il       = il - hparams.n_layer_dense_lead;
+        ggml_tensor * none = ggml_map_custom1_inplace(ctx0, selected_experts, custom_predict, 1, custom_ctx);
+        cb(none, "moe_predict_none", il);
+        ggml_build_forward_expand(gf, none);
+    /////////
+        //end
+
+    }
+
     ggml_tensor * up_exps = moe_unified->get_ups(ctx0,il - hparams.n_layer_dense_lead);
     ggml_tensor * gate_exps = moe_unified->get_gates(ctx0,il - hparams.n_layer_dense_lead);
     ggml_tensor * down_exps = moe_unified->get_downs(ctx0,il - hparams.n_layer_dense_lead);
