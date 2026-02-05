@@ -81,7 +81,7 @@ struct custom_hparams {
     const bool      optimization;
     const float     utilization       = 0.7f;
     const uint32_t  n_predict_experts = 1;
-    const uint32_t  n_prefetch_layers = 2;
+    const uint32_t  n_prefetch_layers = 1;
     uint32_t        n_preload_layers  = 0;
     uint32_t        head_il           = 0;
     uint32_t        tail_il           = 0;
@@ -128,10 +128,9 @@ class custom_async_io{
         if (id == 0) {
             int res = cqe->res;
             int flags = cqe->flags;
-            
             printf("[CQE] user_data=%lu, res=%d, flags=%d\n", 
                 id, res, flags);
-                // throw std::runtime_error(std::string("refresh_completionsO error:revice idx_data of 0"));
+                throw std::runtime_error(std::string("error async_submit transmission:: idx_data of 0"));
         }
         // 标记该 CQE 已处理
         io_uring_cqe_seen(&ring, cqe);
@@ -146,7 +145,7 @@ class custom_async_io{
 
     public:
 
-    custom_async_io(const std::string & fname,int queue_depth = 512){
+    custom_async_io(const std::string & fname,int queue_depth = 640){
         //no params is no used yet
         int ret = io_uring_queue_init_params(queue_depth, &ring, &params);
         if (ret < 0) {
@@ -360,6 +359,27 @@ private:
     std::vector<std::list<int32_t>>                         lru_lists;
     // 2. expert_iters[layer_id][expert_id]: a vector of iterators for quick access to each expert's position in the LRU list
     std::vector<std::vector<std::list<int32_t>::iterator>>  layer_iters;
+    std::mutex                                              hit_mutex;
+    void move_forward(uint32_t layer_id, std::list<int32_t>::iterator it, size_t n_steps) {
+        auto& list = lru_lists[layer_id];
+        
+        if (it == list.begin()) {
+            return;
+        }
+        // calculate the distance from begin to it 
+        auto dist = std::distance(list.begin(), it);
+        
+        std::list<int32_t>::iterator dest_it;
+        if ((size_t)dist < n_steps) {
+            // if had been there, move to the front
+            dest_it = list.begin();
+        } else {
+            // or move n_steps forward
+            dest_it = std::prev(it, n_steps);
+        }
+        // move the element to the new position
+        list.splice(dest_it, list, it);
+    }
 
 public: 
     custom_expert_manage(custom_expert_table& table) 
@@ -381,8 +401,8 @@ public:
         auto& iters = layer_iters[layer_id];
         auto& list = lru_lists[layer_id];
         GGML_ASSERT(iters[expert_id] == list.end() && "Expert already active");
-        list.push_front(expert_id);
-        iters[expert_id] = list.begin();
+        list.push_back(expert_id);
+        iters[expert_id] = --list.end();
         n_active[layer_id] += 1;
         GGML_ASSERT(n_active[layer_id] <= n_expert && "Active count exceeds number of experts");
     }
@@ -425,27 +445,34 @@ public:
         auto& iters = layer_iters[layer_id];
         auto& list = lru_lists[layer_id];
         auto it = iters[expert_id];
-
-        if (it == list.end()) {
-            // has in the active list
-            active(layer_id, expert_id);
-        }
+        GGML_ASSERT(it == list.end());
+        active(layer_id, expert_id);
     }
 
     // hit function
-    void hit(uint32_t layer_id, int32_t expert_id) {
+    void hit(uint32_t layer_id, int32_t expert_id, float probs) {
+        std::lock_guard<std::mutex> lock(hit_mutex);
         GGML_ASSERT(layer_id < n_layer && 0 <= expert_id && expert_id < n_expert);
-
         auto& iters = layer_iters[layer_id];
         auto& list = lru_lists[layer_id];
         
         auto it = iters[expert_id];
         if (it != list.end()) {
             // has in the active list
-            list.splice(list.begin(), list, it);
+            if(probs >= 0.1){
+                list.splice(list.begin(), list, it);
+            }else if (probs >= 0.008)
+            {
+                move_forward(layer_id, it, 20);
+            }
+            
+            else{
+                move_forward(layer_id, it, 10);
+            }
         } else {
             // activate it
             active(layer_id, expert_id);
+            move_forward(layer_id, iters[expert_id], 10);
         }
     }
 
@@ -467,6 +494,7 @@ public:
 
         int32_t select_layer = -1;
         int32_t max_active = -1;
+        //traversing all layer to get max active layer_id
         for(int32_t i = 1; i < static_cast<int32_t>(n_layer);i++){
             int32_t id = (cur_layer_id - i) >= 0 ? (cur_layer_id - i) : (n_layer + cur_layer_id - i);
             if((n_active[id] > max_active) && (id != load_layer_id)){
@@ -490,7 +518,7 @@ public:
 
 class custom_moe_unified{
 public:
-    custom_moe_unified(const llama_model & model,const std::string & fname,llama_model_loader & ml,bool enable_optimizations,float utilization);
+    custom_moe_unified(const llama_model & model,const std::string & fname,llama_model_loader & ml,bool enable_optimizations,float utilization,uint32_t n_prefetch_layers);
     ~custom_moe_unified() = default;
     //menbers
     bool                                        optimizations;
@@ -556,6 +584,6 @@ struct runtime_ctx{
 //
 //custom op_kernel
 //
-void id_pos_map(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth,  void * userdata);
+void id_pos_map(struct ggml_tensor * dst , const struct ggml_tensor * a,const struct ggml_tensor * b, int ith, int nth,  void * userdata);
 
 void custom_predict(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth,  void * userdata);

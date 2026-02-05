@@ -10,6 +10,7 @@ static void print_usage(int, char ** argv) {
     printf("\n");
 }
 
+
 int main(int argc, char ** argv) {
     // path to the model gguf file
     std::string model_path;
@@ -21,7 +22,8 @@ int main(int argc, char ** argv) {
     int n_predict = 99;
     bool optimizations = false;
     // parse command line arguments
-
+    int m_u = 0;
+    int predict_layer = 1;
     {
         int i = 1;
         for (; i < argc; i++) {
@@ -50,6 +52,30 @@ int main(int argc, char ** argv) {
                         if(std::stoi(argv[++i])){
                             optimizations = true;
                         }
+                    } catch (...) {
+                        print_usage(argc, argv);
+                        return 1;
+                    }
+                } else {
+                    print_usage(argc, argv);
+                    return 1;
+                }
+            } else if (strcmp(argv[i], "-mu") == 0) {
+                if (i + 1 < argc) {
+                    try {
+                        m_u = std::stoi(argv[++i]);
+                    } catch (...) {
+                        print_usage(argc, argv);
+                        return 1;
+                    }
+                } else {
+                    print_usage(argc, argv);
+                    return 1;
+                }
+            }else if (strcmp(argv[i], "-pn") == 0) {
+                if (i + 1 < argc) {
+                    try {
+                        predict_layer = std::stoi(argv[++i]);
                     } catch (...) {
                         print_usage(argc, argv);
                         return 1;
@@ -97,9 +123,9 @@ int main(int argc, char ** argv) {
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = ngl;
 #ifdef CUSTOM_MOE
-    model_params.moe_memory_utilization = (float) 0.46;
+    model_params.moe_memory_utilization = (float) (0.46 - m_u * 0.01);
     model_params.moe_enable_optimizations = optimizations;
-
+    model_params.n_prefetch_layers = predict_layer;
 #endif
     model_params.use_mmap = false;// mmap will map all file or weight
 
@@ -125,7 +151,10 @@ int main(int argc, char ** argv) {
 
     // initialize the context
 
+
+
     llama_context_params ctx_params = llama_context_default_params();
+
     // n_ctx is the context size
     ctx_params.n_ctx = n_prompt + n_predict - 1;
     // n_batch is the maximum number of tokens that can be processed in a single call to llama_decode
@@ -133,7 +162,7 @@ int main(int argc, char ** argv) {
     // enable performance counters
     ctx_params.no_perf = false;
     // ctx_params.n_threads = 1;
-    ctx_params.n_threads_batch = 4;
+    ctx_params.n_threads_batch = 5;
     llama_context * ctx = llama_init_from_model(model, ctx_params);
 
     if (ctx == NULL) {

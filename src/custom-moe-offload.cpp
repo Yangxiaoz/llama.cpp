@@ -104,8 +104,8 @@ custom_expert_table::custom_expert_table(uint32_t n_moe_layer, uint32_t n_expert
 
 
 
-custom_moe_unified::custom_moe_unified(const llama_model & model,const std::string & fname,llama_model_loader & ml,bool enable_optimizations,float utilization) 
-    : params{enable_optimizations,utilization,1,2,0,0,0,0},
+custom_moe_unified::custom_moe_unified(const llama_model & model,const std::string & fname,llama_model_loader & ml,bool enable_optimizations,float utilization,uint32_t n_prefetch_layers) 
+    : params{enable_optimizations,utilization,1,n_prefetch_layers,0,0,0,0},
       hparams(model.hparams),
       model(model),
       async_io(fname),
@@ -258,8 +258,12 @@ void custom_moe_unified::check_layer(uint32_t il){
 
     }else{// no trigger yet
         //blocking load the layer now 
+
+    // moe_unified->params.head_il;
+
         GGML_ASSERT(il > 0);//the first layer should always be activate
-        uint32_t prev_il = il -1;
+        // uint32_t prev_il = il-1;
+        uint32_t prev_il = params.head_il;
 
         //TEMP: tempprary implementation 
         //always use the pool of prev layer to load cur layer of weight
@@ -271,6 +275,8 @@ void custom_moe_unified::check_layer(uint32_t il){
 
         //load layer to pool
         load_layer(il,pos,io_mode::block);
+        params.head_il  = params.head_il + 1;
+        params.tail_il  = params.tail_il + 1;
     }
 }
 
@@ -310,12 +316,14 @@ bool custom_moe_unified::predict_expert(uint32_t il,uint32_t id){
             GGML_ASSERT(pos != -1);
         }  
         load_expert(il,id,pos,io_mode::async);
+        manage.get()->touch(il,id);
         return true;
     }
     return false;
 }
 void custom_moe_unified::predict_layer(uint32_t head_il,uint32_t tail_il){
     GGML_ASSERT(tail_il <(hparams.n_layer - hparams.n_layer_dense_lead));
+
 
     //TEMP: tempprary implementation 
     //always use the pool of prev layer to load cur layer of weight
@@ -451,7 +459,6 @@ void custom_moe_unified::_free_layer(uint32_t il){
 
 void custom_moe_unified::load_expert(uint32_t il, int32_t id,llama_pos target_pos,io_mode mode){
     table.mark(il,id,expert_state::Loading,target_pos);
-    manage.get()->touch(il,id);
     //load data
         //io::block
     if(mode == io_mode::block){
@@ -544,6 +551,8 @@ llama_pos custom_moe_unified::free_lru(uint32_t cur_layer_id, uint32_t load_laye
 
     int32_t free_layer_id = management->get_freeLayer_id(cur_layer_id,load_layer_id);
     GGML_ASSERT(free_layer_id != -1 && "erro in free_lru: no layer to free");
+    //temp pop the head to free
+    
     int32_t expert_id = management->get_back_n(free_layer_id, 0);
     GGML_ASSERT(expert_id != -1 && "erro in free_lru: no expert to free");
     GGML_ASSERT(table.at(free_layer_id,expert_id).state == expert_state::InMemory);
@@ -650,14 +659,14 @@ std::string extra_copyname(const std::string& str) {
 }
 
 // mapping the select_id to pos of pool
-void id_pos_map(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth,  void * userdata){
+void id_pos_map(struct ggml_tensor * dst , const struct ggml_tensor * a, const struct ggml_tensor * b, int ith, int nth,  void * userdata){
     GGML_ASSERT(userdata != nullptr);
     GGML_ASSERT(ggml_are_same_shape(dst, a));
     GGML_ASSERT(a->ne[2] == a->ne[3]);
     GGML_ASSERT(a->ne[2] == 1);
-    
     bool prefill = (a->ne[1] > 1);
     const int32_t       * a_data        = (int32_t *)ggml_get_data(a);
+    float               * probs         = (float   *)ggml_get_data(b);
     int32_t             * dst_data      = (int32_t *)ggml_get_data(dst);
     runtime_ctx         * ctx           = (runtime_ctx *)userdata;
     custom_moe_unified  * moe_unified   = ctx->moe_unified;
@@ -674,18 +683,24 @@ void id_pos_map(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith
         //prefill check
         sync.wait_initialization([&]{//only first thread will call 
         if(prefill)moe_unified->check_layer(il);
+        
         });
         const int dr = (n_token + nth - 1) / nth;
         const int ie0 = dr * ith;
         const int ie1 = MIN(ie0 + dr, n_token);
+        int warmup_layer = moe_unified->hparams.n_layer - moe_unified->params.n_preload_layers -moe_unified->hparams.n_layer_dense_lead;
+        int warmup_token = 30;
+        GGML_ASSERT(a->ne[1] > 30 &&"the prefill warm up need token greater 30");
         //mapping
         for(int i = ie0; i < ie1; i++){
             for(int j = 0; j < n_ids; j++){
-                //TBD: warnning! multithread erro
-                // manage->hit(il,a_data[i*(a->nb[1] / 4) + j]);
                 dst_data[i*(dst->nb[1] / 4) +j] = moe_unified->id_map(il,a_data[i*(a->nb[1] / 4) + j]);
+                if((il > warmup_layer) && (i > ie1 - warmup_token)) manage->hit(il,a_data[i*(a->nb[1] / 4) + j],1);
+                    
             }
         }
+        if(ith == 0)delete ctx;
+        
         sync.mark_completion(nth);
     } else{// no parallel
         if(ith == 0){
@@ -693,7 +708,7 @@ void id_pos_map(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith
                 //check
                 moe_unified->check_expert(il,a_data[i]);
                 //record the hit event
-                manage->hit(il,a_data[i]);
+                manage->hit(il,a_data[i],probs[a_data[i]]);
                 //mapping
                 dst_data[i] = moe_unified->id_map(il,a_data[i]);
             }
@@ -725,9 +740,8 @@ void custom_predict(struct ggml_tensor * dst , const struct ggml_tensor * top_k,
                     break;
             }
         }else{//prefill
-            //TODO: need head_il and tail_il
             if(il == 0)return;
-            if((il == moe_unified->hparams.n_layer - moe_unified->hparams.n_layer_dense_lead -2))return;
+            if((il >= moe_unified->hparams.n_layer - moe_unified->hparams.n_layer_dense_lead -2))return;
             //predict or prefetch the next layer
             if((il <= moe_unified->params.n_prefetch_layers) || (il == moe_unified->params.tail_il -1)){
                 uint32_t head_il = moe_unified->params.head_il;

@@ -1898,7 +1898,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     };
 
 #ifdef CUSTOM_MOE
-    //TBD: the moe_ctx seemly no used
+
     int n_expert_layer = hparams.n_layer - hparams.n_layer_dense_lead;
     const size_t moe_ctx_size = n_expert_layer * 3 * ggml_tensor_overhead();
     ggml_context * moe_table_ctx = nullptr;
@@ -2918,10 +2918,16 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
                         // MoE branch
                         const int64_t n_ff_exp = hparams.n_ff_exp ? hparams.n_ff_exp : n_ff / n_expert_used;
-
-                        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
-                        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
-                        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+                            
+                        #ifdef CUSTOM_MOE //arc related
+                            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, TENSOR_EXPERT_WEIGHT);
+                            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, TENSOR_EXPERT_WEIGHT);
+                            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, TENSOR_EXPERT_WEIGHT);
+                        #else
+                            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+                            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
+                            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+                        #endif
                     }
                 } break;
             case LLM_ARCH_PHI2:
@@ -8507,6 +8513,27 @@ struct llm_build_qwen3moe : public llm_graph_context {
                     LLM_NORM_RMS, il);
             cb(cur, "ffn_norm", il);
 
+            #ifdef CUSTOM_MOE
+                ggml_tensor * predict = nullptr;
+                ggml_tensor * predict_probs_b = nullptr;
+                if((model.moe_unified->params.optimization) && ((uint32_t)il < hparams.n_layer-1)) {
+                predict = model.layers[il + 1].ffn_gate_inp;
+                predict_probs_b = nullptr;
+                }
+
+                ggml_tensor * moe_out =
+                    build_moe_ffn_offload(gf,cur,
+                            model.layers[il].ffn_gate_inp,
+                            nullptr,
+                            predict,
+                            predict_probs_b,
+                            model.moe_unified.get(),
+                            n_expert, n_expert_used,
+                            LLM_FFN_SILU, true,
+                            false, 0.0,
+                            LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
+                            il);
+            #else            
             ggml_tensor * moe_out =
                 build_moe_ffn(cur,
                         model.layers[il].ffn_gate_inp,
@@ -8519,6 +8546,7 @@ struct llm_build_qwen3moe : public llm_graph_context {
                         false, 0.0,
                         LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
                         il);
+            #endif
             cb(moe_out, "ffn_moe_out", il);
             cur = moe_out;
 
@@ -17541,6 +17569,7 @@ llama_model_params llama_model_default_params() {
 #ifdef CUSTOM_MOE
         /*.moe_memory_utilization      =*/(float)0.3,
         /*.moe_enable_optimizations    =*/ false,
+        /*.n_prefetch_layers           =*/ 1,
 #endif
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,

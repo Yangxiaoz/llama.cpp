@@ -669,13 +669,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn_offload(
     runtime_ctx* custom_ctx = new runtime_ctx;
     custom_ctx->moe_unified = moe_unified;
     custom_ctx->il       = il - hparams.n_layer_dense_lead;
-    ggml_tensor * select_map = ggml_map_custom1(ctx0, selected_experts, id_pos_map, 1, custom_ctx);
+    ggml_tensor * select_map = ggml_map_custom2(ctx0, selected_experts,selection_probs, id_pos_map, 1, custom_ctx);//selection_probs
     cb(select_map, "moe_topk_pos", il);
     ggml_build_forward_expand(gf, select_map);
 
     //predict
-/////////
-
+    /////////
     if (moe_unified->params.optimization && predict_inp != nullptr){
         ggml_tensor * logits = build_lora_mm(predict_inp, cur); // [n_expert, n_tokens]
         cb(logits, "moe_predict_logits", il);

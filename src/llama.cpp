@@ -130,8 +130,9 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
         // init moe_table
         float utilization = params.moe_memory_utilization;
         bool enable_optimizations = params.moe_enable_optimizations;
+        uint32_t  n_prefetch_layers = params.n_prefetch_layers;
         GGML_ASSERT(utilization >0 && utilization<1);
-        model.moe_unified.reset(new custom_moe_unified(model,fname,ml,enable_optimizations,utilization));
+        model.moe_unified.reset(new custom_moe_unified(model,fname,ml,enable_optimizations,utilization,n_prefetch_layers));
         model.moe_unified.get()->prefill_init();
     #endif
     } catch (const std::exception & err) {
