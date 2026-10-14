@@ -1654,6 +1654,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
         }
+        #ifdef CUSTOM_MOE
+        auto moe_gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(moe_gpu), is_swa);
+        return {moe_gpu,&pimpl->cpu_buft_list};
+        #endif        
         const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
         auto * dev = devices.at(layer_gpu).dev;
         LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
@@ -1672,6 +1677,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
+
+#ifdef CUSTOM_MOE
+
+    int n_expert_layer = hparams.n_layer() - hparams.n_layer_dense_lead;
+    const size_t moe_ctx_size = n_expert_layer * 3 * ggml_tensor_overhead();
+    {
+        ggml_init_params params = {
+            /*.mem_size   =*/ moe_ctx_size,
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        ml.moe_table_ctx = ggml_init(params);
+
+        if (!ml.moe_table_ctx) {
+            throw std::runtime_error(format("failed to create ggml context"));
+        }
+    }
+#endif
 
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
@@ -1844,7 +1867,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
     }
-
+#ifdef CUSTOM_MOE
+    table_ctx.reset(ml.moe_table_ctx);
+#endif
     ml.done_getting_tensors();
 
     if (per_layer_tok_embd && ml.lazy.has(per_layer_tok_embd)) {
@@ -3335,6 +3360,11 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+#ifdef CUSTOM_MOE
+        /*.moe_memory_utilization      =*/(float)0.3,
+        /*.moe_enable_optimizations    =*/ false,
+        /*.n_prefetch_layers           =*/ 1,
+#endif
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,

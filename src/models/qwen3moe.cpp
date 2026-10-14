@@ -48,10 +48,16 @@ void llama_model_qwen3moe::load_arch_tensors(llama_model_loader &) {
 
         // MoE branch
         const int64_t n_ff_exp = hparams.n_ff_exp() ? hparams.n_ff_exp() : n_ff / n_expert_used;
-
+    #ifdef CUSTOM_MOE //arc related
+        const auto TENSOR_EXPERT_WEIGHT   = llama_model_loader::TENSOR_EXPERT_WEIGHT;
+        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, TENSOR_EXPERT_WEIGHT);
+        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, TENSOR_EXPERT_WEIGHT);
+        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, TENSOR_EXPERT_WEIGHT);
+    #else
         layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
         layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
         layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+    #endif
     }
 }
 
@@ -133,6 +139,28 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                 LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
+        #ifdef CUSTOM_MOE
+            ggml_tensor * predict = nullptr;
+            ggml_tensor * predict_probs_b = nullptr;
+            if((model.moe_unified->params.optimization) && ((uint32_t)il < hparams.n_layer()-1)) {
+            predict = model.layers[il + 1].ffn_gate_inp;
+            predict_probs_b = nullptr;
+            }
+
+            ggml_tensor * moe_out =
+                build_moe_ffn_offload(gf,cur,
+                        model.layers[il].ffn_gate_inp,
+                        nullptr,
+                        predict,
+                        predict_probs_b,
+                        model.moe_unified.get(),
+                        n_expert, n_expert_used,
+                        LLM_FFN_SILU, true,
+                        false, 0.0,
+                        LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
+                        il);
+        #else 
+
         ggml_tensor * moe_out =
             build_moe_ffn(cur,
                     model.layers[il].ffn_gate_inp,
@@ -149,6 +177,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                     model.layers[il].ffn_up_exps_s,
                     model.layers[il].ffn_gate_exps_s,
                     model.layers[il].ffn_down_exps_s);
+        #endif
         cb(moe_out, "ffn_moe_out", il);
         cur = moe_out;
 

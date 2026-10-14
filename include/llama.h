@@ -346,7 +346,11 @@ extern "C" {
 
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
-
+#ifdef CUSTOM_MOE
+        float moe_memory_utilization;
+        bool  moe_enable_optimizations;
+        uint32_t  n_prefetch_layers;
+#endif
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool check_tensors;   // validate model tensor data

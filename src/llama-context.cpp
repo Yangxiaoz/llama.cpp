@@ -2519,7 +2519,11 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         // so they cost ~8.6 nodes per tensor against ~5.9 for a plain DFlash draft
         res = std::max<uint32_t>(1024u, 12u*model.n_tensors());
     } else {
+        #ifdef CUSTOM_MOE
+            return std::max<uint32_t>(1024u, 10u*model.n_tensors());
+        #else        
         res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
+        #endif
         for (const auto & lora : model.loras) {
             res += lora->get_n_nodes();
         }

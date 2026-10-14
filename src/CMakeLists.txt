@@ -4,6 +4,16 @@ llama_add_compile_flags()
 # libraries
 #
 
+#custom add:
+##ifdef CUSTOM_MOE
+# check liburing
+find_library(LIBURING_LIBRARY NAMES uring)
+if(NOT LIBURING_LIBRARY)
+    message(FATAL_ERROR "liburing 未找到 - 请安装: sudo apt install liburing-dev")
+endif()
+find_path(LIBURING_INCLUDE_DIR NAMES liburing.h)
+#end
+
 # llama
 
 file(GLOB LLAMA_MODELS_SOURCES "models/*.cpp")
@@ -40,6 +50,7 @@ set(LLAMA_CORE_SOURCES
     llama-quant.cpp
     llama-sampler.cpp
     llama-vocab.cpp
+    custom-moe-offload.cpp
     unicode-data.cpp
     unicode.cpp
 )
@@ -64,6 +75,19 @@ set_source_files_properties(${LLAMA_CORE_SOURCES} ../include/llama.h unicode.h
     PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
 
 configure_file(llama-version.h.in ${CMAKE_CURRENT_BINARY_DIR}/llama-version.h @ONLY)
+
+#custom add
+##ifdef CUSTOM_MOE
+# target_include_directories(llama PRIVATE ${LIBURING_LIBRARY})
+if(LIBURING_INCLUDE_DIR AND LIBURING_LIBRARY)
+    message(STATUS "liburing found")
+    target_include_directories(llama PRIVATE ${LIBURING_INCLUDE_DIR})
+    target_link_libraries(llama PRIVATE ${LIBURING_LIBRARY})
+    target_compile_definitions(llama PRIVATE LLAMA_USE_LIBURING)
+else()
+    message(WARNING "liburing not found - custom-moe-offload.cpp will be compiled without io_uring support")
+endif()
+#end
 
 target_include_directories(llama PRIVATE . ${CMAKE_CURRENT_BINARY_DIR})
 target_include_directories(llama PUBLIC ../include)

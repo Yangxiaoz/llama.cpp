@@ -70,7 +70,10 @@ struct llama_model_loader {
     static const int TENSOR_SKIP_IF_VIRTUAL = 1 << 3;
     static const int TENSOR_ALLOW_RESHAPE   = 1 << 4;
     static const int TENSOR_READ_LAZY       = 1 << 5; // read rows on demand instead of loading whole tensor; requires mmap for now
-
+    #ifdef CUSTOM_MOE
+    static const int TENSOR_EXPERT_WEIGHT   = 1 << 7;
+    ggml_context *   moe_table_ctx = nullptr;
+    #endif
     int n_kv      = 0;
     int n_tensors = 0;
     int n_created = 0;

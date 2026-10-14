@@ -369,7 +369,15 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         if (!model->load_tensors(ml)) {
             return {-2, nullptr};
         }
-
+    #ifdef CUSTOM_MOE
+        // init moe_table
+        float utilization = params.moe_memory_utilization;
+        bool enable_optimizations = params.moe_enable_optimizations;
+        uint32_t  n_prefetch_layers = params.n_prefetch_layers;
+        GGML_ASSERT(utilization >0 && utilization<1);
+        model->moe_unified.reset(new custom_moe_unified(*model,fname,ml,enable_optimizations,utilization,n_prefetch_layers));
+        model->moe_unified.get()->prefill_init();
+    #endif
         return {0, model_ptr.release()};
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading model: %s\n", __func__, err.what());

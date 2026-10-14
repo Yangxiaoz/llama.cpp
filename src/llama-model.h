@@ -14,6 +14,10 @@
 #include <unordered_set>
 #include <vector>
 
+#ifdef CUSTOM_MOE
+#include "custom-moe-offload.h"
+#endif
+
 struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
@@ -765,7 +769,10 @@ struct llama_model {
     std::vector<int32_t> target_layer_ids;
 
     std::vector<llama_layer> layers;
-
+#ifdef CUSTOM_MOE
+    ggml_context_ptr         table_ctx;
+    std::unique_ptr<custom_moe_unified> moe_unified;
+#endif
     //Dense linear projections for SentenceTransformers models like embeddinggemma
     // For Sentence Transformers models structure see
     // https://sbert.net/docs/sentence_transformer/usage/custom_models.html#structure-of-sentence-transformer-models

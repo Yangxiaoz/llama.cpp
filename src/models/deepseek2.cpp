@@ -133,9 +133,14 @@ void llama_model_deepseek2::load_arch_tensors(llama_model_loader & ml) {
             }
 
             // MoE branch
+            #ifdef CUSTOM_MOE 
+            const auto TENSOR_EXPERT_WEIGHT   = llama_model_loader::TENSOR_EXPERT_WEIGHT;
+            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, TENSOR_EXPERT_WEIGHT);
+            create_tensor_gate_up_exps(layer, i, n_embd, n_ff_exp, n_expert, TENSOR_EXPERT_WEIGHT);
+            #else
             layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, flags);
             create_tensor_gate_up_exps(layer, i, n_embd, n_ff_exp, n_expert, flags);
-
+            #endif
             // Shared expert branch
             layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, n_ff_exp * n_expert_shared}, flags);
             layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {        n_ff_exp * n_expert_shared, n_embd}, flags);
@@ -647,6 +652,27 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
             cb(cur, "ffn_out", il);
         } else {
             // MoE branch
+            #ifdef CUSTOM_MOE
+                ggml_tensor * predict = nullptr;
+                ggml_tensor * predict_probs_b = nullptr;
+                if((model.moe_unified->params.optimization) && ((uint32_t)il < hparams.n_layer()-1)) {
+                predict = model.layers[il + 1].ffn_gate_inp;
+                predict_probs_b = model.layers[il + 1].ffn_exp_probs_b;
+                }
+
+                ggml_tensor * moe_out =
+                    build_moe_ffn_offload(gf,cur,
+                            model.layers[il].ffn_gate_inp,
+                            model.layers[il].ffn_exp_probs_b,
+                            predict,
+                            predict_probs_b,
+                            model.moe_unified.get(),
+                            n_expert, n_expert_used,
+                            LLM_FFN_SILU, hparams.expert_weights_norm,
+                            true, hparams.expert_weights_scale,
+                            (llama_expert_gating_func_type) hparams.expert_gating_func,
+                            il);
+            #else
             ggml_tensor * moe_out = build_moe_ffn(cur,
                 model.layers[il].ffn_gate_inp,
                 model.layers[il].ffn_up_exps,
@@ -660,6 +686,7 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
                 il,
                 nullptr,
                 model.layers[il].ffn_gate_up_exps);
+            #endif
             cb(moe_out, "ffn_moe_out", il);
 
             // FFN shared expert
