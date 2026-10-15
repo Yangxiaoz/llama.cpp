@@ -228,13 +228,13 @@ int main(int argc, char ** argv) {
     ctx_params.no_perf = false;
 
 #ifdef CUSTOM_MOE
-    // the offload path supports a single prefill ubatch only, so the prompt must not be split
-    ctx_params.n_ubatch = n_prompt;
-    // the prefill path asserts on batches of 2..30 tokens
-    if (n_prompt <= 30) {
-        fprintf(stderr, "%s: error: custom MoE offload needs a prompt of more than 30 tokens, got %d\n", __func__, n_prompt);
+    // an empty prompt gives 0 tokens on models without BOS (e.g. Qwen3), and n_batch = 0 fails late with an unclear error
+    if (n_prompt <= 0) {
+        fprintf(stderr, "%s: error: the prompt is empty\n", __func__);
         return 1;
     }
+    // the offload path supports a single prefill ubatch only, so the prompt must not be split
+    ctx_params.n_ubatch = n_prompt;
 #endif
 
     llama_context * ctx = llama_init_from_model(model, ctx_params);

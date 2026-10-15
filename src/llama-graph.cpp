@@ -1754,12 +1754,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn_offload(
         ggml_tensor * weights_sum = ggml_sum_rows(ctx0, weights); // [1, n_tokens]
         cb(weights_sum, "ffn_moe_weights_sum", il);
 
+        // Avoid division by zero, clamp to smallest number representable by F16
+        weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY);
+        cb(weights_sum, "ffn_moe_weights_sum_clamped", il);
+
         weights = ggml_div(ctx0, weights, weights_sum); // [n_expert_used, n_tokens]
         cb(weights, "ffn_moe_weights_norm", il);
 
         weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
     }
-    if (scale_w) {
+    // same as build_moe_ffn: a scale of 0 means "not set" in the GGUF
+    if (scale_w && w_scale != 0.0f && w_scale != 1.0f) {
         weights = ggml_scale(ctx0, weights, w_scale);
         cb(weights, "ffn_moe_weights_scaled", il);
     }

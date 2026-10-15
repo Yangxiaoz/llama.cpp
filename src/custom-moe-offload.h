@@ -122,8 +122,8 @@ class custom_async_io{
     // 状态表：key 是 idx (user_data), value 是当前状态
     // std::unordered_map<int, request_status> request_status_map_;
 
-    //update the signal of cqe to request status map
-    uint32_t process_cqe(struct io_uring_cqe* cqe) {
+    //update the signal of cqe to request status map, return {user_data, bytes read}
+    std::pair<uint32_t, int> process_cqe(struct io_uring_cqe* cqe) {
         const uint64_t id  = cqe->user_data;
         const int      res = cqe->res;
         if (id == 0) {
@@ -138,7 +138,7 @@ class custom_async_io{
                 std::string("async I/O error: ") + strerror(-res)
             );
         }
-        return static_cast<uint32_t>(id);
+        return {static_cast<uint32_t>(id), res};
     }
 
     void init_ring(io_uring & r, unsigned queue_depth){
@@ -185,7 +185,7 @@ class custom_async_io{
     //func
     void block_read(char * buf, size_t size, size_t offset);
     bool async_submit(uint64_t idx,char * buf, size_t size, size_t offset);
-    std::vector<uint32_t> refresh_completions();
+    std::vector<std::pair<uint32_t, int>> refresh_completions();
 
 };
 
@@ -252,7 +252,8 @@ public:
     custom_expert_table(uint32_t n_moe_layer, uint32_t n_expert);
 //members
     std::vector<std::vector<custom_expert_group>>   experts;
-    std::vector<std::array<ggml_type, NUM_EXPERT>>  layer_type; //up gate down
+    std::vector<std::array<ggml_type, NUM_EXPERT>>  layer_type;  //up gate down
+    std::vector<std::array<size_t, NUM_EXPERT>>     layer_nbyte; //bytes of one expert in the file, up gate down
     
 // func
     custom_expert_group& at(uint32_t row, int32_t col){
@@ -331,10 +332,13 @@ public:
     }
     
     void refresh(class custom_async_io& async_io){
-        auto compelete_ids = async_io.refresh_completions();
-        for (auto data_id : compelete_ids) {
+        auto completions = async_io.refresh_completions();
+        for (auto [data_id, n_read] : completions) {
             //get il and expert_id from id
             auto [layer_id, expert_id,type] = unmap(data_id);
+            if ((size_t) n_read != layer_nbyte[layer_id][static_cast<int>(type)]) {
+                throw std::runtime_error("async I/O error: short read");
+            }
             auto is_complete = load_ctx.at(layer_id).transfor_complete(expert_id);
             if(is_complete){
                 //layer load complete
@@ -355,170 +359,83 @@ public:
 };
 
 
+// standard LRU over all experts held in the pool (any layer)
+// front = most recently used, back = least recently used
 class custom_expert_manage {
 private:
-    uint32_t n_layer;
-    int32_t n_expert;
-    std::vector<int32_t>                                    n_active;
-    // 1. lru_lists[layer_id]: a doubly linked list for each layer, store the expert_id in LRU order
-    std::vector<std::list<int32_t>>                         lru_lists;
-    // 2. expert_iters[layer_id][expert_id]: a vector of iterators for quick access to each expert's position in the LRU list
-    std::vector<std::vector<std::list<int32_t>::iterator>>  layer_iters;
-    std::mutex                                              hit_mutex;
-    void move_forward(uint32_t layer_id, std::list<int32_t>::iterator it, size_t n_steps) {
-        auto& list = lru_lists[layer_id];
-        
-        if (it == list.begin()) {
-            return;
-        }
-        // calculate the distance from begin to it 
-        auto dist = std::distance(list.begin(), it);
-        
-        std::list<int32_t>::iterator dest_it;
-        if ((size_t)dist < n_steps) {
-            // if had been there, move to the front
-            dest_it = list.begin();
-        } else {
-            // or move n_steps forward
-            dest_it = std::prev(it, n_steps);
-        }
-        // move the element to the new position
-        list.splice(dest_it, list, it);
+    using lru_key = std::pair<uint32_t, int32_t>; // {moe layer, expert id}
+
+    uint32_t                                            n_layer;
+    int32_t                                             n_expert;
+    std::list<lru_key>                                  lru;
+    // iters[il][id] points into lru, lru.end() = not tracked (std::list keeps end() valid)
+    std::vector<std::vector<std::list<lru_key>::iterator>> iters;
+    std::mutex                                          mutex; // use() is called by all threads in prefill
+
+    void check(uint32_t il, int32_t id) const {
+        GGML_ASSERT(il < n_layer && 0 <= id && id < n_expert && "expert_manage index out of bounds");
     }
 
-public: 
-    custom_expert_manage(custom_expert_table& table) 
-        : n_layer(table.row_size()),
-          n_expert(table.col_size()),
-          n_active(n_layer, 0)
-    {
-        // initialize the two-deminsional values
-        lru_lists.resize(n_layer);
-        layer_iters.resize(n_layer);
-        for (uint32_t i = 0; i < n_layer; ++i) {
-            layer_iters[i].resize(n_expert, lru_lists[i].end());
-        }
+public:
+    custom_expert_manage(uint32_t n_layer, int32_t n_expert)
+        : n_layer(n_layer),
+          n_expert(n_expert),
+          iters(n_layer, std::vector<std::list<lru_key>::iterator>(n_expert, lru.end())) {}
+
+    // the expert got a slot in the pool (loading or loaded)
+    void insert(uint32_t il, int32_t id) {
+        std::lock_guard<std::mutex> lock(mutex);
+        check(il, id);
+        GGML_ASSERT(iters[il][id] == lru.end() && "expert already in lru");
+        lru.push_front({il, id});
+        iters[il][id] = lru.begin();
     }
-    
-    void active(uint32_t layer_id, int32_t expert_id) {
-        GGML_ASSERT(layer_id < n_layer && 0 <= expert_id && expert_id < n_expert);
-        
-        auto& iters = layer_iters[layer_id];
-        auto& list = lru_lists[layer_id];
-        GGML_ASSERT(iters[expert_id] == list.end() && "Expert already active");
-        list.push_back(expert_id);
-        iters[expert_id] = --list.end();
-        n_active[layer_id] += 1;
-        GGML_ASSERT(n_active[layer_id] <= n_expert && "Active count exceeds number of experts");
-    }
-    
-    void active_layer(uint32_t layer_id) {
-        GGML_ASSERT(layer_id < n_layer);
-        for(int i = 0; i < n_expert; i++){
-            active(layer_id, i);
+
+    void insert_layer(uint32_t il) {
+        for (int32_t id = 0; id < n_expert; id++) {
+            insert(il, id);
         }
     }
 
-    void erase(uint32_t layer_id, int32_t expert_id) {
-        GGML_ASSERT(layer_id < n_layer && 0 <= expert_id && expert_id < n_expert);
-        
-        auto& iters = layer_iters[layer_id];
-        auto& list = lru_lists[layer_id];
-
-        auto it = iters[expert_id];
-        if (it != list.end()) {
-            list.erase(it); 
-            iters[expert_id] = list.end(); // set to end to indicate not active
-        }
-        n_active[layer_id] -= 1;
-        GGML_ASSERT(n_active[layer_id] >= 0 && "Active count below zero");
+    // the expert is used by the current token
+    void use(uint32_t il, int32_t id) {
+        std::lock_guard<std::mutex> lock(mutex);
+        check(il, id);
+        auto it = iters[il][id];
+        GGML_ASSERT(it != lru.end() && "used expert is not in the pool");
+        lru.splice(lru.begin(), lru, it);
     }
 
-    void erase_layer(uint32_t layer_id) {
-        GGML_ASSERT(layer_id < n_layer);
-        lru_lists[layer_id].clear();
-        layer_iters[layer_id].clear();
-        layer_iters[layer_id].resize(n_expert, lru_lists[layer_id].end());
-        GGML_ASSERT(n_active[layer_id] == n_expert && "Active count should be n_expert before clearing");
-        n_active[layer_id] = 0;
-    }
-
-    // only touch, do not change the  lru order
-    void touch(uint32_t layer_id, int32_t expert_id) {
-        GGML_ASSERT(layer_id < n_layer && 0 <= expert_id && expert_id < n_expert);
-
-        auto& iters = layer_iters[layer_id];
-        auto& list = lru_lists[layer_id];
-        auto it = iters[expert_id];
-        GGML_ASSERT(it == list.end());
-        active(layer_id, expert_id);
-    }
-
-    // hit function
-    void hit(uint32_t layer_id, int32_t expert_id, float probs) {
-        std::lock_guard<std::mutex> lock(hit_mutex);
-        GGML_ASSERT(layer_id < n_layer && 0 <= expert_id && expert_id < n_expert);
-        auto& iters = layer_iters[layer_id];
-        auto& list = lru_lists[layer_id];
-        
-        auto it = iters[expert_id];
-        if (it != list.end()) {
-            // has in the active list
-            if(probs >= 0.1){
-                list.splice(list.begin(), list, it);
-            }else if (probs >= 0.008)
-            {
-                move_forward(layer_id, it, 20);
-            }
-            
-            else{
-                move_forward(layer_id, it, 10);
-            }
-        } else {
-            // activate it
-            active(layer_id, expert_id);
-            move_forward(layer_id, iters[expert_id], 10);
+    // the expert left the pool
+    void erase(uint32_t il, int32_t id) {
+        std::lock_guard<std::mutex> lock(mutex);
+        check(il, id);
+        auto it = iters[il][id];
+        if (it != lru.end()) {
+            lru.erase(it);
+            iters[il][id] = lru.end();
         }
     }
 
-    /*lru func*/
-    /*return the expert id at position n from the back of the list*/
-    int32_t get_back_n(uint32_t layer_id, int n) const {
-        auto& list = lru_lists[layer_id];
-        GGML_ASSERT(n >= 0 && n <= static_cast<int>(list.size()));
-
-        auto rit = list.rbegin();
-        std::advance(rit, n); 
-        return *rit;
+    void erase_layer(uint32_t il) {
+        for (int32_t id = 0; id < n_expert; id++) {
+            erase(il, id);
+        }
     }
-    ///
-    /*get the most expert layer*/
-    /*if all layer except 'need_layer' have no enough experts,select the prev of cur_layer_id*/
-    int32_t get_freeLayer_id(int32_t cur_layer_id,int32_t load_layer_id){
-        GGML_ASSERT((cur_layer_id < static_cast<int32_t>(n_layer)) && (load_layer_id < static_cast<int32_t>(n_layer)));
 
-        int32_t select_layer = -1;
-        int32_t max_active = -1;
-        //traversing all layer to get max active layer_id
-        for(int32_t i = 1; i < static_cast<int32_t>(n_layer);i++){
-            int32_t id = (cur_layer_id - i) >= 0 ? (cur_layer_id - i) : (n_layer + cur_layer_id - i);
-            if((n_active[id] > max_active) && (id != load_layer_id)){
-                max_active = n_active[id];
-                select_layer = id;
+    // least recently used expert accepted by can_evict(il, id), return false if there is none
+    template <typename F>
+    bool victim(F && can_evict, uint32_t & il, int32_t & id) {
+        std::lock_guard<std::mutex> lock(mutex);
+        for (auto rit = lru.rbegin(); rit != lru.rend(); ++rit) {
+            if (can_evict(rit->first, rit->second)) {
+                il = rit->first;
+                id = rit->second;
+                return true;
             }
         }
-        if (select_layer != -1){
-            return select_layer;
-        }
-        for(int32_t i = 1; i < static_cast<int32_t>(n_layer);i++){
-            int32_t id = (cur_layer_id - i) >= 0 ? (cur_layer_id - i) : (n_layer + cur_layer_id - i);
-            if((n_active[id] > 0) && (id != load_layer_id)){
-                return id;
-            }
-        }
-        return -1;
+        return false;
     }
-
 };
 
 class custom_moe_unified;
@@ -541,7 +458,7 @@ public:
     //
     // custom_moe_unified  API
     //
-    uint32_t                                total_size() const;
+    size_t                                  total_size() const;
     void                                    prefill_init();//pre-load the initial some layer of moe_weight
     void                                    check_layer(uint32_t il);
     void                                    check_expert(uint32_t il,uint32_t id);
@@ -557,8 +474,8 @@ public:
 private:
     const llama_model                       &model;
     //menbers
-    uint32_t                                expert_ne[2];
     // size_t: slot offsets (pos * nbyte_slot) can exceed 4 GiB
+    // slot size = the largest expert over all moe layers, smaller experts leave a gap at the slot end
     size_t                                  nbyte_slot_up;
     size_t                                  nbyte_slot_gate;
     size_t                                  nbyte_slot_down;
@@ -582,8 +499,10 @@ private:
     void        _free_layer(uint32_t il);
     void        load_expert(uint32_t il, int32_t id,llama_pos target_pos,io_mode mode);
     void        load_layer(uint32_t il, llama_pos target_pos,io_mode mode);
-    llama_pos   free_random(const std::vector<uint32_t>& excluded_layers);
-    llama_pos   free_lru(uint32_t cur_layer_id,uint32_t load_layer_id);
+    // an expert can be evicted if it is fully loaded and not in the layer being computed (cur_il)
+    bool        can_evict(uint32_t il, int32_t id, uint32_t cur_il);
+    llama_pos   free_random(uint32_t cur_il);
+    llama_pos   free_lru(uint32_t cur_il);
 
     //
     // pool API
