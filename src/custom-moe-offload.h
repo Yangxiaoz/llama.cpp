@@ -116,63 +116,68 @@ struct custom_pool_type{
 class custom_async_io{
     private:
     int                 fd;
-    io_uring            ring;
+    io_uring            ring;       // async reads only (prefetch), completions handled by refresh_completions()
+    io_uring            block_ring; // blocking reads only, so a wait can never consume an async completion
     std::mutex          submit_mutex;
-    io_uring_params     params{};
     // 状态表：key 是 idx (user_data), value 是当前状态
     // std::unordered_map<int, request_status> request_status_map_;
 
     //update the signal of cqe to request status map
     uint32_t process_cqe(struct io_uring_cqe* cqe) {
-        uint64_t id = cqe->user_data;
+        const uint64_t id  = cqe->user_data;
+        const int      res = cqe->res;
         if (id == 0) {
-            int res = cqe->res;
-            int flags = cqe->flags;
-            printf("[CQE] user_data=%lu, res=%d, flags=%d\n", 
-                id, res, flags);
+            printf("[CQE] user_data=%lu, res=%d, flags=%d\n",
+                id, res, cqe->flags);
                 throw std::runtime_error(std::string("error async_submit transmission:: idx_data of 0"));
         }
-        // 标记该 CQE 已处理
+        // 标记该 CQE 已处理 (after reading it: the slot may be reused once seen)
         io_uring_cqe_seen(&ring, cqe);
-        if (cqe->res < 0) {
-            int err = -cqe->res;
+        if (res < 0) {
             throw std::runtime_error(
-                std::string("async I/O error: ") + strerror(err)
+                std::string("async I/O error: ") + strerror(-res)
             );
         }
         return static_cast<uint32_t>(id);
     }
 
-    public:
-
-    custom_async_io(const std::string & fname,int queue_depth = 640){
-        //no params is no used yet
-        int ret = io_uring_queue_init_params(queue_depth, &ring, &params);
+    void init_ring(io_uring & r, unsigned queue_depth){
+        io_uring_params params{};
+        int ret = io_uring_queue_init_params(queue_depth, &r, &params);
         if (ret < 0) {
             throw std::runtime_error("Failed to initialize io_uring: " + std::string(strerror(-ret)));
         }
+        //register the fd
+        int fixed_fds[] = {fd};
+        ret = io_uring_register_files(&r,fixed_fds,1);
+        if (ret < 0) {
+            throw std::runtime_error("Failed to register file to io_uring: " + std::string(strerror(-ret)));
+        }
+
+        // mlock is best effort: a low RLIMIT_MEMLOCK must not stop the load
+        if (mlock(r.sq.ring_ptr, r.sq.ring_sz)) {
+            perror("mlock sq ring failed");
+        }
+        if (mlock(r.cq.ring_ptr, r.cq.ring_sz)) {
+            perror("mlock cq ring failed");
+        }
+        if (mlock(r.sq.sqes, r.sq.ring_entries * sizeof(struct io_uring_sqe))) {
+            perror("mlock sqes failed");
+        }
+    }
+
+    public:
+
+    custom_async_io(const std::string & fname,int queue_depth = 640){
         fd = open(fname.c_str(), O_RDONLY);// note: O_DIRECT is currently not be support
         if (fd < 0) {
             throw std::runtime_error("Failed to open file: " + std::string(strerror(errno)));
         }
-        //register the fd 
-        int fixed_fds[] = {fd};
-        io_uring_register_files(&ring,fixed_fds,1);
-
-        // 1. 锁定提交队列 (SQ) ring
-        if (mlock(ring.sq.ring_ptr, ring.sq.ring_sz)) {
-            perror("mlock sq ring failed");
-        }
-        // 2. 锁定完成队列 (CQ) ring
-        if (mlock(ring.cq.ring_ptr, ring.cq.ring_sz)) {
-            perror("mlock cq ring failed");
-        }
-        size_t sqes_size = ring.sq.sqes->len * sizeof(struct io_uring_sqe);
-        if (mlock(ring.sq.sqes, sqes_size) != 0) {
-            throw std::runtime_error(std::string("Failed to mlock SQEs array: ") + strerror(errno));
-        }
+        init_ring(ring, queue_depth);
+        init_ring(block_ring, 4); // block_read keeps at most one request in flight
     }
     ~custom_async_io(){
+        io_uring_queue_exit(&block_ring);
         io_uring_queue_exit(&ring);
         close(fd);
     }
@@ -516,6 +521,13 @@ public:
 
 };
 
+class custom_moe_unified;
+
+struct runtime_ctx{
+    custom_moe_unified  * moe_unified;
+    int   il;
+};
+
 class custom_moe_unified{
 public:
     custom_moe_unified(const llama_model & model,const std::string & fname,llama_model_loader & ml,bool enable_optimizations,float utilization,uint32_t n_prefetch_layers);
@@ -538,15 +550,18 @@ public:
     llama_pos                               id_map(uint32_t il, int32_t selec_id);
     ggml_tensor *                           get_ups(struct ggml_context * ctx, uint32_t il) const;
     ggml_tensor *                           get_gates(struct ggml_context * ctx, uint32_t il) const;
-    ggml_tensor *                           get_downs(struct ggml_context * ctx, uint32_t il) const;    
-    
+    ggml_tensor *                           get_downs(struct ggml_context * ctx, uint32_t il) const;
+    // userdata of the custom ops; owned here because a reused graph runs the same op many times
+    runtime_ctx *                           get_runtime_ctx(uint32_t il);
+
 private:
     const llama_model                       &model;
     //menbers
     uint32_t                                expert_ne[2];
-    uint32_t                                nbyte_slot_up;
-    uint32_t                                nbyte_slot_gate;
-    uint32_t                                nbyte_slot_down;
+    // size_t: slot offsets (pos * nbyte_slot) can exceed 4 GiB
+    size_t                                  nbyte_slot_up;
+    size_t                                  nbyte_slot_gate;
+    size_t                                  nbyte_slot_down;
     uint32_t                                n_slots_layer;    // number of slots in one layer
     struct  custom_pool_type                pool_type;
     struct  custom_expert_pool              pool;
@@ -554,6 +569,7 @@ private:
     class   custom_expert_table             table;    
     std::vector<ggml_context_ptr>           ctxs;
     std::vector<ggml_backend_buffer_ptr>    bufs;
+    std::vector<runtime_ctx>                rt_ctxs;    // one per moe layer, never resized
     std::random_device                      rd;  // random seed
     //
     //common
@@ -576,11 +592,6 @@ private:
     void        pool_free(llama_pos pos, int32_t n);
 };
 
-
-struct runtime_ctx{
-    custom_moe_unified  * moe_unified;
-    int   il;
-};
 //
 //custom op_kernel
 //

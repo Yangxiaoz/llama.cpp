@@ -227,6 +227,16 @@ int main(int argc, char ** argv) {
     // enable performance counters
     ctx_params.no_perf = false;
 
+#ifdef CUSTOM_MOE
+    // the offload path supports a single prefill ubatch only, so the prompt must not be split
+    ctx_params.n_ubatch = n_prompt;
+    // the prefill path asserts on batches of 2..30 tokens
+    if (n_prompt <= 30) {
+        fprintf(stderr, "%s: error: custom MoE offload needs a prompt of more than 30 tokens, got %d\n", __func__, n_prompt);
+        return 1;
+    }
+#endif
+
     llama_context * ctx = llama_init_from_model(model, ctx_params);
 
     if (ctx == NULL) {

@@ -18,7 +18,7 @@ std::string extra_copyname(const std::string& str) ;
 
 void custom_async_io::block_read(char * buf, size_t size, size_t offset){
     // get sqe_handle
-    struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+    struct io_uring_sqe* sqe = io_uring_get_sqe(&block_ring);
     if (!sqe) {
         throw std::runtime_error("Failed to get SQE");
     }
@@ -27,22 +27,25 @@ void custom_async_io::block_read(char * buf, size_t size, size_t offset){
     sqe->flags |= IOSQE_FIXED_FILE;
 
     // submit
-    int ret = io_uring_submit(&ring);
+    int ret = io_uring_submit(&block_ring);
     if (ret < 0) {
         throw std::runtime_error("custom_asyncio::Failed to submit request:" + std::string(strerror(-ret)));
     }
 
     // waiting for complete
     struct io_uring_cqe* cqe;
-    ret = io_uring_wait_cqe(&ring, &cqe);
+    ret = io_uring_wait_cqe(&block_ring, &cqe);
     if (ret < 0) {
         throw std::runtime_error("custom_asyncio::Failed to wait for completion:" + std::string(strerror(-ret)));
     }
     //clean cur cqe
     int read_bytes = cqe->res;
-    io_uring_cqe_seen(&ring, cqe);
+    io_uring_cqe_seen(&block_ring, cqe);
     if (read_bytes < 0) {
-        throw std::runtime_error("custom_asyncio::Read failed in block reading");
+        throw std::runtime_error("custom_asyncio::Read failed in block reading: " + std::string(strerror(-read_bytes)));
+    }
+    if ((size_t) read_bytes != size) {
+        throw std::runtime_error("custom_asyncio::Short read in block reading");
     }
 }
 
@@ -157,7 +160,7 @@ custom_moe_unified::custom_moe_unified(const llama_model & model,const std::stri
     ggml_backend_dev_get_props(dev, &props);
 
     //get the number of slots in pool
-    uint32_t nbyte_group = nbyte_slot_up + nbyte_slot_gate + nbyte_slot_down; 
+    size_t nbyte_group = nbyte_slot_up + nbyte_slot_gate + nbyte_slot_down;
     uint64_t n_byte_availa = (uint64_t)(utilization * props.memory_total);
     int32_t n_slots  = n_byte_availa / nbyte_group;
 
@@ -222,7 +225,16 @@ custom_moe_unified::custom_moe_unified(const llama_model & model,const std::stri
     params.head_il = 0;
     params.tail_il = params.n_preload_layers;
     params.n_mean_expert = n_slots / n_moe_layer;
-  
+
+    rt_ctxs.resize(n_moe_layer);
+    for (uint32_t il = 0; il < n_moe_layer; il++) {
+        rt_ctxs[il] = { this, (int) il };
+    }
+}
+
+runtime_ctx * custom_moe_unified::get_runtime_ctx(uint32_t il) {
+    GGML_ASSERT(il < rt_ctxs.size());
+    return &rt_ctxs[il];
 }
 
 uint32_t custom_moe_unified::total_size() const {
@@ -702,8 +714,7 @@ void id_pos_map(struct ggml_tensor * dst , const struct ggml_tensor * a, const s
                     
             }
         }
-        if(ith == 0)delete ctx;
-        
+
         sync.mark_completion(nth);
     } else{// no parallel
         if(ith == 0){
@@ -715,7 +726,6 @@ void id_pos_map(struct ggml_tensor * dst , const struct ggml_tensor * a, const s
                 //mapping
                 dst_data[i] = moe_unified->id_map(il,a_data[i]);
             }
-            delete ctx;
         }
     }
 }
@@ -757,8 +767,7 @@ void custom_predict(struct ggml_tensor * dst , const struct ggml_tensor * top_k,
                 return;
             }
         }
-        delete ctx;
     }
 
-    
+
 }

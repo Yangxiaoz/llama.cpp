@@ -1626,10 +1626,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn_predict(
     cb(selected_experts, "moe_predict_topk", il);
     ggml_build_forward_expand(gf, selected_experts);
 
-    //operator defined by customer  
-    runtime_ctx* custom_ctx = new runtime_ctx;
-    custom_ctx->moe_unified = moe_unified;
-    custom_ctx->il       = il - hparams.n_layer_dense_lead;
+    //operator defined by customer
+    runtime_ctx * custom_ctx = moe_unified->get_runtime_ctx(il - hparams.n_layer_dense_lead);
     ggml_tensor * none = ggml_map_custom1_inplace(ctx0, selected_experts, custom_predict, 1, custom_ctx);
     cb(none, "moe_predict_none", il);
     ggml_build_forward_expand(gf, none);
@@ -1695,10 +1693,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn_offload(
     cb(selected_experts, "ffn_moe_topk", il);
     ggml_build_forward_expand(gf, selected_experts);
 
-    //operator defined by customer  
-    runtime_ctx* custom_ctx = new runtime_ctx;
-    custom_ctx->moe_unified = moe_unified;
-    custom_ctx->il       = il - hparams.n_layer_dense_lead;
+    //operator defined by customer
+    runtime_ctx * custom_ctx = moe_unified->get_runtime_ctx(il - hparams.n_layer_dense_lead);
     ggml_tensor * select_map = ggml_map_custom2(ctx0, selected_experts,selection_probs, id_pos_map, 1, custom_ctx);//selection_probs
     cb(select_map, "moe_topk_pos", il);
     ggml_build_forward_expand(gf, select_map);
@@ -1736,9 +1732,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn_offload(
         cb(selected_experts->src[0], "moe_predict_argsort", il);
         cb(selected_experts, "moe_predict_topk", il);
         ggml_build_forward_expand(gf, selected_experts);
-        runtime_ctx* custom_ctx = new runtime_ctx;
-        custom_ctx->moe_unified = moe_unified;
-        custom_ctx->il       = il - hparams.n_layer_dense_lead;
         ggml_tensor * none = ggml_map_custom1_inplace(ctx0, selected_experts, custom_predict, 1, custom_ctx);
         cb(none, "moe_predict_none", il);
         ggml_build_forward_expand(gf, none);
