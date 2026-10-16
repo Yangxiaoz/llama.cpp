@@ -317,6 +317,15 @@ extern "C" {
         ggml_backend_buffer_type_t buft;
     };
 
+#ifdef CUSTOM_MOE
+    // how MoE experts are loaded from disk into the expert pool
+    enum llama_moe_mode {
+        LLAMA_MOE_MODE_ON_DEMAND   = 0, // blocking loads of the experts in use, random eviction, no prediction
+        LLAMA_MOE_MODE_CROSS_LAYER = 1, // prefill and decode: layer i predicts layer i+1, LRU
+        LLAMA_MOE_MODE_IO_AWARE    = 2, // prefill predicts one layer at a time with the latest input, paced by the IO queue, decode the next layer, LRU
+    };
+#endif
+
     struct llama_model_params {
         // NULL-terminated list of devices to use for offloading (if NULL, all available devices are used)
         ggml_backend_dev_t * devices;
@@ -347,9 +356,9 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 #ifdef CUSTOM_MOE
-        float moe_memory_utilization;
-        bool  moe_enable_optimizations;
-        uint32_t  n_prefetch_layers;
+        enum llama_moe_mode moe_mode;
+        float    moe_pool_ratio;       // fraction of the device memory used as the expert pool, 0 < F < 1
+        uint32_t moe_io_queue;         // io-aware mode: prefill predicts a new layer only while fewer experts are being read, 0 = experts per layer
 #endif
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights

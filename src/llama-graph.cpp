@@ -1578,69 +1578,11 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
 }
 
 #ifdef CUSTOM_MOE
-//build_moe_ffn_offload
-ggml_tensor * llm_graph_context::build_moe_ffn_predict(
-         ggml_cgraph * gf,
-         ggml_tensor * cur,
-         ggml_tensor * predict_inp,//1
-         ggml_tensor * exp_probs_b,//1
-  custom_moe_unified * moe_unified,
-             int64_t   n_expert_used,
-         llama_expert_gating_func_type gating_op,//1
-                int   il) const {
-    //CUSTOM_MOE func
-    // const int64_t n_embd   = cur->ne[0];
-    // const int64_t n_tokens = cur->ne[1];
-
-
-    ggml_tensor * logits = build_lora_mm(predict_inp, cur); // [n_expert, n_tokens]
-    cb(logits, "moe_predict_logits", il);
-
-    ggml_tensor * probs = nullptr;
-    switch (gating_op) {
-        case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:
-            {
-                probs = ggml_soft_max(ctx0, logits); // [n_expert, n_tokens]
-            } break;
-        case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID:
-            {
-                probs = ggml_sigmoid(ctx0, logits); // [n_expert, n_tokens]
-            } break;
-        default:
-            GGML_ABORT("fatal error");
-    }
-    cb(probs, "moe_predict_probs", il);
-
-    // add experts selection bias - introduced in DeepSeek V3
-    // leave probs unbiased as it's later used to get expert weights
-    ggml_tensor * selection_probs = probs;
-    if (exp_probs_b != nullptr) {
-        selection_probs = ggml_add(ctx0, probs, exp_probs_b);
-        cb(selection_probs, "moe_predict_probs_biased", il);
-    }
-
-
-    // select experts
-    ggml_tensor * selected_experts = ggml_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
-    cb(selected_experts->src[0], "moe_predict_argsort", il);
-    cb(selected_experts, "moe_predict_topk", il);
-    ggml_build_forward_expand(gf, selected_experts);
-
-    //operator defined by customer
-    runtime_ctx * custom_ctx = moe_unified->get_runtime_ctx(il - hparams.n_layer_dense_lead);
-    ggml_tensor * none = ggml_map_custom1_inplace(ctx0, selected_experts, custom_predict, 1, custom_ctx);
-    cb(none, "moe_predict_none", il);
-    ggml_build_forward_expand(gf, none);
-    return none;
-}
-
 ggml_tensor * llm_graph_context::build_moe_ffn_offload(
          ggml_cgraph * gf,
          ggml_tensor * cur,
          ggml_tensor * gate_inp,
          ggml_tensor * exp_probs_b,
-         ggml_tensor * predict_inp,
-         ggml_tensor * predict_probs_b,
   custom_moe_unified * moe_unified,
              int64_t   n_expert,
              int64_t   n_expert_used,
@@ -1654,90 +1596,85 @@ ggml_tensor * llm_graph_context::build_moe_ffn_offload(
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
+    const uint32_t il_moe = il - hparams.n_layer_dense_lead;
 
-    ggml_tensor * logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
-    cb(logits, "ffn_moe_logits", il);
+    // router -> probs -> (+bias) -> top_k, shared by the real routing and the prediction of other layers
+    auto build_select = [&](ggml_tensor * router, ggml_tensor * router_b, ggml_tensor ** probs_out, const char * prefix) {
+        ggml_tensor * logits = build_lora_mm(router, cur); // [n_expert, n_tokens]
+        cb(logits, (std::string(prefix) + "_logits").c_str(), il);
 
-    ggml_tensor * probs = nullptr;
-    switch (gating_op) {
-        case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:
-            {
-                probs = ggml_soft_max(ctx0, logits); // [n_expert, n_tokens]
-            } break;
-        case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID:
-            {
-                probs = ggml_sigmoid(ctx0, logits); // [n_expert, n_tokens]
-            } break;
-        default:
-            GGML_ABORT("fatal error");
-    }
-    cb(probs, "ffn_moe_probs", il);
-
-    // add experts selection bias - introduced in DeepSeek V3
-    // leave probs unbiased as it's later used to get expert weights
-    ggml_tensor * selection_probs = probs;
-    if (exp_probs_b != nullptr) {
-        selection_probs = ggml_add(ctx0, probs, exp_probs_b);
-        cb(selection_probs, "ffn_moe_probs_biased", il);
-    }
-
-    // llama4 doesn't have exp_probs_b, and sigmoid is only used after top_k
-    // see: https://github.com/meta-llama/llama-models/blob/699a02993512fb36936b1b0741e13c06790bcf98/models/llama4/moe.py#L183-L198
-    if (arch == LLM_ARCH_LLAMA4) {
-        selection_probs = logits;
-    }
-
-    // select experts
-    ggml_tensor * selected_experts = ggml_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
-    cb(selected_experts->src[0], "ffn_moe_argsort", il);
-    cb(selected_experts, "ffn_moe_topk", il);
-    ggml_build_forward_expand(gf, selected_experts);
-
-    //operator defined by customer
-    runtime_ctx * custom_ctx = moe_unified->get_runtime_ctx(il - hparams.n_layer_dense_lead);
-    ggml_tensor * select_map = ggml_map_custom2(ctx0, selected_experts,selection_probs, id_pos_map, 1, custom_ctx);//selection_probs
-    cb(select_map, "moe_topk_pos", il);
-    ggml_build_forward_expand(gf, select_map);
-
-    //predict
-    /////////
-    if (moe_unified->params.optimization && predict_inp != nullptr){
-        ggml_tensor * logits = build_lora_mm(predict_inp, cur); // [n_expert, n_tokens]
-        cb(logits, "moe_predict_logits", il);
-    
-        ggml_tensor * predict_probs = nullptr;
+        ggml_tensor * probs = nullptr;
         switch (gating_op) {
             case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:
                 {
-                    predict_probs = ggml_soft_max(ctx0, logits); // [n_expert, n_tokens]
+                    probs = ggml_soft_max(ctx0, logits); // [n_expert, n_tokens]
                 } break;
             case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID:
                 {
-                    predict_probs = ggml_sigmoid(ctx0, logits); // [n_expert, n_tokens]
+                    probs = ggml_sigmoid(ctx0, logits); // [n_expert, n_tokens]
                 } break;
             default:
                 GGML_ABORT("fatal error");
         }
-        cb(predict_probs, "moe_predict_probs", il);
-    
+        cb(probs, (std::string(prefix) + "_probs").c_str(), il);
+
         // add experts selection bias - introduced in DeepSeek V3
         // leave probs unbiased as it's later used to get expert weights
-        ggml_tensor * selection_probs = predict_probs;
-        if (predict_probs_b != nullptr) {
-            selection_probs = ggml_add(ctx0, predict_probs, predict_probs_b);
-            cb(selection_probs, "moe_predict_probs_biased", il);
+        ggml_tensor * selection_probs = probs;
+        if (router_b != nullptr) {
+            selection_probs = ggml_add(ctx0, probs, router_b);
+            cb(selection_probs, (std::string(prefix) + "_probs_biased").c_str(), il);
         }
-            // select experts
-        ggml_tensor * selected_experts = ggml_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
-        cb(selected_experts->src[0], "moe_predict_argsort", il);
-        cb(selected_experts, "moe_predict_topk", il);
-        ggml_build_forward_expand(gf, selected_experts);
-        ggml_tensor * none = ggml_map_custom1_inplace(ctx0, selected_experts, custom_predict, 1, custom_ctx);
+
+        // llama4 doesn't have exp_probs_b, and sigmoid is only used after top_k
+        // see: https://github.com/meta-llama/llama-models/blob/699a02993512fb36936b1b0741e13c06790bcf98/models/llama4/moe.py#L183-L198
+        if (arch == LLM_ARCH_LLAMA4) {
+            selection_probs = logits;
+        }
+
+        ggml_tensor * selected = ggml_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
+        cb(selected->src[0], (std::string(prefix) + "_argsort").c_str(), il);
+        cb(selected, (std::string(prefix) + "_topk").c_str(), il);
+        ggml_build_forward_expand(gf, selected);
+
+        if (probs_out) {
+            *probs_out = probs;
+        }
+        return std::make_pair(selected, selection_probs);
+    };
+
+    ggml_tensor * probs = nullptr;
+    auto [selected_experts, selection_probs] = build_select(gate_inp, exp_probs_b, &probs, "ffn_moe");
+
+    // expert id -> pool slot, loads the missing experts of this layer first
+    ggml_tensor * select_map = ggml_map_custom2(ctx0, selected_experts, selection_probs, id_pos_map, 1, moe_unified->get_runtime_ctx(il_moe));
+    cb(select_map, "moe_topk_pos", il);
+    ggml_build_forward_expand(gf, select_map);
+
+    // predict the experts of later layers from the input of this layer, the loads overlap with the compute
+    // must come after select_map: id_pos_map sets moe_unified->cur_il, which the prediction protects from eviction
+    for (uint32_t target : moe_unified->predict_targets(il_moe, n_tokens > 1)) {
+        ggml_tensor * predicted = build_select(moe_unified->router(target), moe_unified->router_bias(target), nullptr, "moe_predict").first;
+        ggml_tensor * none = ggml_map_custom1_inplace(ctx0, predicted, custom_predict, 1, moe_unified->get_runtime_ctx(target));
         cb(none, "moe_predict_none", il);
         ggml_build_forward_expand(gf, none);
-    /////////
-        //end
+    }
 
+    // io-aware prefill: the target layer is chosen when this layer runs (custom_frontier), so its router rows are selected by index
+    if (moe_unified->predicts_frontier(il_moe, n_tokens > 1)) {
+        ggml_tensor * args[] = { select_map }; // runs after id_pos_map
+        ggml_tensor * rows = ggml_custom_4d(ctx0, GGML_TYPE_I32, n_expert, 1, 1, 1, args, 1, custom_frontier, 1, moe_unified->get_runtime_ctx(il_moe));
+        cb(rows, "moe_frontier_rows", il);
+
+        ggml_tensor * router   = ggml_get_rows(ctx0, moe_unified->routers_all, rows); // [n_embd, n_expert]
+        ggml_tensor * router_b = nullptr;
+        if (moe_unified->router_biases_all) {
+            router_b = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, moe_unified->router_biases_all, rows), n_expert);
+        }
+        ggml_tensor * predicted = build_select(router, router_b, nullptr, "moe_frontier").first;
+        ggml_tensor * none = ggml_map_custom1_inplace(ctx0, predicted, custom_predict_frontier, 1, moe_unified->get_runtime_ctx(il_moe));
+        cb(none, "moe_frontier_none", il);
+        ggml_build_forward_expand(gf, none);
     }
 
     ggml_tensor * up_exps = moe_unified->get_ups(ctx0,il - hparams.n_layer_dense_lead);

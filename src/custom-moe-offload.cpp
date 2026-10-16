@@ -59,7 +59,10 @@ bool custom_async_io::async_submit(uint64_t idx,char * buf, size_t size, size_t 
         throw std::runtime_error("async_submit: Failed to get SQE");
     }
     io_uring_prep_read(sqe, 0, buf, size, offset);//0: the index of register file
-    sqe->flags |= IOSQE_FIXED_FILE;
+    // IOSQE_ASYNC: without it the kernel first tries the buffered read inline, so the page cache copy (and the
+    // readahead retries, as task_work) run on the submitting compute thread and stall the whole graph.
+    // with it a kernel io-wq worker does the read and the copy, the compute threads only reap the completion
+    sqe->flags |= IOSQE_FIXED_FILE | IOSQE_ASYNC;
     sqe->user_data = idx;
 
     
@@ -80,10 +83,16 @@ bool custom_async_io::async_submit(uint64_t idx,char * buf, size_t size, size_t 
     // 新增方法 1: 刷新函数 (非阻塞)
     // 检查并处理所有当前已完成的请求
     // ==========================================
-std::vector<std::pair<uint32_t, int>> custom_async_io::refresh_completions() {
+std::vector<std::pair<uint32_t, int>> custom_async_io::refresh_completions(bool wait) {
     struct io_uring_cqe* cqe;
     std::vector<std::pair<uint32_t, int>> completed;
 
+    if (wait) {
+        int ret = io_uring_wait_cqe(&ring, &cqe);
+        if (ret < 0) {
+            throw std::runtime_error("custom_asyncio::Failed to wait for completion:" + std::string(strerror(-ret)));
+        }
+    }
     while (io_uring_peek_cqe(&ring, &cqe) == 0) {
         // 获取到了一个 cqe
         completed.push_back(process_cqe(cqe)); // 内部调用 seen，移动队列指针
@@ -96,7 +105,8 @@ std::vector<std::pair<uint32_t, int>> custom_async_io::refresh_completions() {
 custom_expert_table::custom_expert_table(uint32_t n_moe_layer, uint32_t n_expert)
     :n_row(n_moe_layer),
      n_col(n_expert),
-     load_ctx(n_moe_layer, LoadContext(n_expert)),
+     pending_io(n_moe_layer, std::vector<uint8_t>(n_expert, 0)),
+     n_resident(n_moe_layer, 0),
      experts(n_moe_layer,std::vector<custom_expert_group>(n_expert)),
      layer_type(n_moe_layer),
      layer_nbyte(n_moe_layer)
@@ -104,8 +114,32 @@ custom_expert_table::custom_expert_table(uint32_t n_moe_layer, uint32_t n_expert
 
 
 
-custom_moe_unified::custom_moe_unified(const llama_model & model,const std::string & fname,llama_model_loader & ml,bool enable_optimizations,float utilization,uint32_t n_prefetch_layers) 
-    : params{enable_optimizations,utilization,1,n_prefetch_layers,0,0,0,0},
+custom_strategy custom_strategy_for(enum llama_moe_mode mode){
+    switch (mode) {
+        case LLAMA_MOE_MODE_ON_DEMAND:
+            return { io_mode::block, custom_evict_kind::random, custom_victim_kind::policy,         custom_prefill_kind::none,        custom_decode_kind::none       };
+        case LLAMA_MOE_MODE_CROSS_LAYER:
+            return { io_mode::async, custom_evict_kind::lru,    custom_victim_kind::farthest_layer, custom_prefill_kind::cross_layer, custom_decode_kind::next_layer };
+        case LLAMA_MOE_MODE_IO_AWARE:
+            // decode and eviction reuse the cross-layer components for now, swap them here
+            return { io_mode::async, custom_evict_kind::lru,    custom_victim_kind::farthest_layer, custom_prefill_kind::io_aware,    custom_decode_kind::next_layer };
+    }
+    GGML_ABORT("custom moe: unknown mode %d", (int) mode);
+}
+
+const char * custom_moe_mode_name(enum llama_moe_mode mode){
+    switch (mode) {
+        case LLAMA_MOE_MODE_ON_DEMAND:   return "on-demand";
+        case LLAMA_MOE_MODE_CROSS_LAYER: return "cross-layer";
+        case LLAMA_MOE_MODE_IO_AWARE:    return "io-aware";
+    }
+    return "unknown";
+}
+
+custom_moe_unified::custom_moe_unified(const llama_model & model,const std::string & fname,llama_model_loader & ml,enum llama_moe_mode mode,float utilization,uint32_t io_queue)
+    : mode(mode),
+      strategy(custom_strategy_for(mode)),
+      params{utilization,io_queue,0,0},
       hparams(model.hparams),
       model(model),
       async_io(fname),
@@ -182,7 +216,7 @@ custom_moe_unified::custom_moe_unified(const llama_model & model,const std::stri
 
 // create a context for  buffer 
     ggml_init_params buffer_params = {
-        /*.mem_size   =*/ size_t(3 *ggml_tensor_overhead()), //3: up gate down
+        /*.mem_size   =*/ size_t(5 *ggml_tensor_overhead()), //up gate down + routers_all, router_biases_all
         /*.mem_buffer =*/ NULL,
         /*.no_alloc   =*/ true,
     };
@@ -217,6 +251,17 @@ custom_moe_unified::custom_moe_unified(const llama_model & model,const std::stri
         /*free_slots        =*/ {{0,n_slots}}
     };
 
+    // io-aware prefill picks the predicted layer at run time: the graph selects its router rows with get_rows
+    if (strategy.prefill == custom_prefill_kind::io_aware) {
+        ggml_tensor * r0 = router(0);
+        routers_all = ggml_new_tensor_2d(ctx, r0->type, r0->ne[0], r0->ne[1] * moe_layer_count());
+        ggml_format_name(routers_all, "routers_all");
+        if (router_bias(0) != nullptr) {
+            router_biases_all = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, r0->ne[1] * moe_layer_count());
+            ggml_format_name(router_biases_all, "router_biases_all");
+        }
+    }
+
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, host_buft);
@@ -231,23 +276,44 @@ custom_moe_unified::custom_moe_unified(const llama_model & model,const std::stri
         LLAMA_LOG_WARN("%s: moe_expert_pool fell back from %s to %s\n", __func__, ggml_backend_buft_name(host_buft), ggml_backend_buffer_name(buf));
     }
 
+    routers_init();
+
     LLAMA_LOG_INFO("n_slot of pool is:%d \n",n_slots);
     LLAMA_LOG_INFO("%s: %10s moe_expert_pool buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
 
     // the pre-load layer count is bounded by the model: a larger pool keeps every layer resident
     const uint32_t n_moe_layer = hparams.n_layer() - hparams.n_layer_dense_lead;
 
-    //initialize a blank management instance
-    manage = std::make_unique<custom_expert_manage>(n_moe_layer, (int32_t) n_expert);
+    switch (strategy.evict) {
+        case custom_evict_kind::random: evict = std::make_unique<custom_evict_random>(n_moe_layer, (int32_t) n_expert); break;
+        case custom_evict_kind::lru:    evict = std::make_unique<custom_evict_lru>   (n_moe_layer, (int32_t) n_expert); break;
+    }
 
     params.n_preload_layers = std::min<uint32_t>(n_slots /n_slots_layer, n_moe_layer);
-    params.head_il = 0;
-    params.tail_il = params.n_preload_layers;
-    params.n_mean_expert = n_slots / n_moe_layer;
+    // predictions may hold all slots but one layer, so the current layer always finds room (no deadlock)
+    params.reserve_budget   = n_slots - n_expert;
+    if (params.io_queue == 0) {
+        params.io_queue = n_expert;
+    }
 
     rt_ctxs.resize(n_moe_layer);
     for (uint32_t il = 0; il < n_moe_layer; il++) {
         rt_ctxs[il] = { this, (int) il };
+    }
+}
+
+custom_moe_unified::~custom_moe_unified() {
+    const char * names[2] = { "prefill", "decode" };
+    for (int i = 0; i < 2; i++) {
+        const auto & s = stats[i];
+        if (s.n_ensure == 0) {
+            continue;
+        }
+        LLAMA_LOG_INFO("custom_moe stats [%s]: %llu layer runs, used experts: %llu hit, %llu wait, %llu miss | prefetch %llu (used %llu) | read %.1f MiB | ensure %.1f ms, predict %.1f ms\n",
+            names[i], (unsigned long long) s.n_ensure,
+            (unsigned long long) s.n_hit, (unsigned long long) s.n_wait, (unsigned long long) s.n_miss,
+            (unsigned long long) s.n_prefetch, (unsigned long long) s.n_prefetch_used,
+            s.n_bytes / 1024.0 / 1024.0, s.t_ensure_us / 1000.0, s.t_predict_us / 1000.0);
     }
 }
 
@@ -266,102 +332,246 @@ size_t custom_moe_unified::total_size() const {
 }
 
 void custom_moe_unified::prefill_init(){
-    
+
     for(uint32_t il = 0; il < params.n_preload_layers; il++){
         llama_pos slot_pos = pool_alloc(n_slots_layer);
-        load_layer(il,slot_pos,io_mode::block);
+        load_layer(il,slot_pos);
     }
-    
-    LLAMA_LOG_INFO("custom_moe prefill init: %d layers have been pre-load",params.n_preload_layers);
+
+    LLAMA_LOG_INFO("custom_moe: mode = %s, %u layers pre-loaded, reserve budget = %u experts",
+        custom_moe_mode_name(mode), params.n_preload_layers, params.reserve_budget);
+    if (strategy.prefill == custom_prefill_kind::io_aware) {
+        LLAMA_LOG_CONT(", io queue = %u experts", params.io_queue);
+    }
+    LLAMA_LOG_CONT("\n");
 }
 
-void custom_moe_unified::check_layer(uint32_t il){
-    table.refresh(async_io);
-    if(table.layer_check(il)){
-        return;
-    }
-    if(table.is_layer_trigger(il)){//the layer load has been triggered
-        //wait for loading complete
-        while(table.layer_check(il) == false){
-            table.refresh(async_io);
+bool custom_moe_unified::victim_farthest(uint32_t target_il, uint32_t & il, int32_t & id){
+    // prefill visits the layers in order, so the next use of layer l is (l - cur_il) mod n layers away:
+    // the layers finished in this ubatch come last (next ubatch or decode), the layer just finished is the farthest
+    // only layers used after target_il may be evicted, a prefetch never evicts experts needed sooner than its own
+    const uint32_t n_layer  = moe_layer_count();
+    const uint32_t d_target = (target_il + n_layer - cur_il) % n_layer;
+    for(uint32_t d = n_layer - 1; d > d_target; d--){
+        const uint32_t l = (cur_il + d) % n_layer;
+        if(table.resident_count(l) == 0){
+            continue;
         }
-        //layer load complete
-        //mark all expert in layer as expertstate::InMemory
-        table.mark_layer(il,expert_state::InMemory,INVALID_POS);
-        return;
-
-    }else{// no trigger yet
-        //blocking load the layer now 
-
-    // moe_unified->params.head_il;
-
-        GGML_ASSERT(il > 0);//the first layer should always be activate
-        // uint32_t prev_il = il-1;
-        uint32_t prev_il = params.head_il;
-
-        //TEMP: tempprary implementation 
-        //always use the pool of prev layer to load cur layer of weight
-        GGML_ASSERT(table.layer_check(prev_il) == true);
-        //Reuse the pool of prev_layer for cur_layer
-        llama_pos pos = table.at(prev_il,LAYER_HEAD).pos;
-        //free the prev_layer in table
-        _free_layer(prev_il);
-
-        //load layer to pool
-        load_layer(il,pos,io_mode::block);
-        params.head_il  = params.head_il + 1;
-        params.tail_il  = params.tail_il + 1;
-    }
-}
-
-void custom_moe_unified::check_expert(uint32_t il,uint32_t id){
-
-    table.refresh(async_io);
-    auto state = table.at(il,id).state;
-    if(state == expert_state::OnDisk){
-        llama_pos pos = pool_alloc(1);
-        if(pos == -1){
-            pos = params.optimization ? free_lru(il) : free_random(il);
-            GGML_ASSERT(pos != -1 && "custom moe: no expert can be evicted");
-        }
-        load_expert(il,id,pos,io_mode::block);
-    }else if(state == expert_state::Loading){
-        while(1){
-            table.refresh(async_io);
-            if(table.at(il,id).state == expert_state::InMemory){
-                return;
+        for(int32_t e = 0; e < (int32_t) hparams.n_expert; e++){
+            if(can_evict(l,e,cur_il)){
+                il = l;
+                id = e;
+                return true;
             }
         }
     }
-}
-
-// called while layer il-1 is computed, so the experts of il-1 must stay
-bool custom_moe_unified::predict_expert(uint32_t il,uint32_t id){
-    GGML_ASSERT(il > 0);
-    if(table.at(il,id).state == expert_state::OnDisk){
-        llama_pos pos = pool_alloc(1);
-        if(pos == -1){
-            pos = free_lru(il - 1);
-            GGML_ASSERT(pos != -1 && "custom moe: no expert can be evicted");
-        }
-        load_expert(il,id,pos,io_mode::async);
-        return true;
-    }
     return false;
 }
-void custom_moe_unified::predict_layer(uint32_t head_il,uint32_t tail_il){
-    GGML_ASSERT(tail_il <(hparams.n_layer() - hparams.n_layer_dense_lead));
 
+llama_pos custom_moe_unified::alloc_slot(uint32_t target_il, bool wait, bool prefill){
+    const bool farthest = prefill && strategy.prefill_victim == custom_victim_kind::farthest_layer;
+    while(1){
+        llama_pos pos = pool_alloc(1);
+        if(pos == -1){
+            uint32_t il = 0;
+            int32_t  id = 0;
+            const bool found = farthest ? victim_farthest(target_il, il, id)
+                                        : evict->victim([&](uint32_t l, int32_t e){ return can_evict(l,e,cur_il); }, il, id);
+            if(found){
+                pos = table.at(il,id).pos;
+                _free_expert(il,id);
+            }
+        }
+        if(pos != -1 || !wait){
+            return pos;
+        }
+        // every expert that could be evicted is still loading: wait for a read to finish
+        GGML_ASSERT(table.loading_count() > 0 && "custom moe: no expert can be evicted");
+        table.refresh(async_io, true);
+    }
+}
 
-    //TEMP: tempprary implementation 
-    //always use the pool of prev layer to load cur layer of weight
-    GGML_ASSERT(table.layer_check(head_il) == true);
-    //Reuse the pool of prev_layer for cur_layer
-    llama_pos pos = table.at(head_il,LAYER_HEAD).pos;
-    //free the prev_layer in table
-    _free_layer(head_il);
-    //load layer to pool
-    load_layer(tail_il,pos,io_mode::async);
+void custom_moe_unified::ensure(uint32_t il, const std::vector<int32_t> & ids, bool prefill){
+    const int64_t t_start = ggml_time_us();
+    auto & st = stats[prefill ? 0 : 1];
+    st.n_ensure++;
+
+    // layer il runs now: its predictions are consumed (used or not) and its experts are protected
+    cur_il = il;
+    cur_prefill = prefill;
+    table.clear_predicted(il);
+    if(prefill && il == 0){
+        // a new ubatch: no layer is predicted yet
+        frontier = 0;
+    }
+
+    table.refresh(async_io);
+    for(int32_t id : ids){
+        auto & e = table.at(il,id);
+        switch(e.state){
+            case expert_state::InMemory: st.n_hit++;  break;
+            case expert_state::Loading:  st.n_wait++; break;
+            case expert_state::OnDisk:   st.n_miss++; break;
+        }
+        if(e.prefetched){
+            st.n_prefetch_used++;
+        }
+    }
+    for(int32_t id = 0; id < (int32_t) hparams.n_expert; id++){
+        table.at(il,id).prefetched = false;
+    }
+    if(strategy.load == io_mode::block){
+        for(int32_t id : ids){
+            if(table.at(il,id).state == expert_state::OnDisk){
+                load_expert(il,id,alloc_slot(il, true, prefill),io_mode::block);
+            }
+        }
+    }else{
+        // submit all missing experts first, so the reads run in parallel
+        for(int32_t id : ids){
+            if(table.at(il,id).state == expert_state::OnDisk){
+                load_expert(il,id,alloc_slot(il, true, prefill),io_mode::async);
+            }
+        }
+    }
+    // predicted experts may still be loading
+    for(int32_t id : ids){
+        while(table.at(il,id).state != expert_state::InMemory){
+            table.refresh(async_io, true);
+        }
+    }
+    st.t_ensure_us += ggml_time_us() - t_start;
+}
+
+bool custom_moe_unified::reserve_and_load(uint32_t il, int32_t id, bool prefill){
+    auto & e = table.at(il,id);
+    if(e.predicted){
+        return true;
+    }
+    if(table.reserved_count() >= params.reserve_budget){
+        return false;
+    }
+    if(e.state == expert_state::OnDisk){
+        llama_pos pos = alloc_slot(il, false, prefill);
+        if(pos == -1){
+            return false;
+        }
+        load_expert(il,id,pos,io_mode::async);
+        e.prefetched = true;
+        stats[prefill ? 0 : 1].n_prefetch++;
+    }
+    table.reserve(il,id);
+    return true;
+}
+
+// cross-layer prefill: every predicted expert of the next layer il, no wait; what does not fit is loaded when the layer runs
+void custom_moe_unified::prefetch_cross_layer(uint32_t il, const std::vector<int32_t> & ids){
+    for(int32_t id : ids){
+        reserve_and_load(il,id,true);
+    }
+}
+
+// io-aware prefill: every predicted expert of the frontier layer il
+void custom_moe_unified::prefetch_frontier(uint32_t il, const std::vector<int32_t> & ids){
+    bool done = true;
+    for(int32_t id : ids){
+        done = reserve_and_load(il,id,true) && done;
+    }
+    // a layer that did not fit stays the frontier: the next layer predicts it again with a fresher input
+    if(done){
+        frontier = il + 1;
+    }
+}
+
+// decode: the first predicted expert of layer il that is not in the pool
+void custom_moe_unified::predict_next_layer(uint32_t il, const std::vector<int32_t> & ids){
+    for(int32_t id : ids){
+        if(table.at(il,id).state == expert_state::OnDisk){
+            reserve_and_load(il,id,false);
+            return;
+        }
+    }
+}
+
+int32_t custom_moe_unified::next_frontier(){
+    const int64_t t_start = ggml_time_us();
+    table.refresh(async_io);
+    const uint32_t n_layer = moe_layer_count();
+    frontier = std::max(frontier, cur_il + 1);
+    // a layer with all experts in the pool has nothing to load
+    while(frontier < n_layer && table.resident_count(frontier) == (int32_t) hparams.n_expert){
+        frontier++;
+    }
+    // IO is the slower side: while the queue is long, a prediction now would only wait in it,
+    // so skip this layer and let a later layer predict the frontier with a fresher input.
+    // the next layer is needed right away, it is predicted whatever the queue
+    frontier_target = -1;
+    if(frontier < n_layer && (frontier == cur_il + 1 || table.loading_count() < params.io_queue)){
+        frontier_target = (int32_t) frontier;
+    }
+    stats[0].t_predict_us += ggml_time_us() - t_start;
+    return frontier_target;
+}
+
+bool custom_moe_unified::predicts_frontier(uint32_t il, bool prefill) const {
+    return prefill && strategy.prefill == custom_prefill_kind::io_aware && il + 1 < moe_layer_count();
+}
+
+void custom_moe_unified::on_predicted(uint32_t target_il, const std::vector<int32_t> & ids, bool prefill){
+    const int64_t t_start = ggml_time_us();
+    table.refresh(async_io);
+    if(prefill){
+        switch(strategy.prefill){
+            case custom_prefill_kind::none:        break;
+            case custom_prefill_kind::cross_layer: prefetch_cross_layer(target_il, ids); break;
+            case custom_prefill_kind::io_aware:    prefetch_frontier(target_il, ids); break;
+        }
+    }else{
+        switch(strategy.decode){
+            case custom_decode_kind::none:         break;
+            case custom_decode_kind::next_layer:   predict_next_layer(target_il, ids); break;
+        }
+    }
+    stats[prefill ? 0 : 1].t_predict_us += ggml_time_us() - t_start;
+}
+
+std::vector<uint32_t> custom_moe_unified::predict_targets(uint32_t il, bool prefill) const {
+    std::vector<uint32_t> targets;
+    const uint32_t n_moe_layer = hparams.n_layer() - hparams.n_layer_dense_lead;
+    if(!prefill){
+        switch(strategy.decode){
+            case custom_decode_kind::none:
+                break;
+            case custom_decode_kind::next_layer:
+                if(il + 1 < n_moe_layer){
+                    targets.push_back(il + 1);
+                }
+                break;
+        }
+        return targets;
+    }
+    switch(strategy.prefill){
+        case custom_prefill_kind::none:
+            break;
+        case custom_prefill_kind::cross_layer:
+            // the input of layer il predicts layer il+1, its loads overlap with the compute of layer il
+            if(il + 1 < n_moe_layer){
+                targets.push_back(il + 1);
+            }
+            break;
+        case custom_prefill_kind::io_aware:
+            // the target is chosen at run time, see predicts_frontier()
+            break;
+    }
+    return targets;
+}
+
+ggml_tensor * custom_moe_unified::router(uint32_t il) const {
+    return model.layers.at(il + hparams.n_layer_dense_lead).ffn_gate_inp;
+}
+
+ggml_tensor * custom_moe_unified::router_bias(uint32_t il) const {
+    return model.layers.at(il + hparams.n_layer_dense_lead).ffn_exp_probs_b;
 }
 
 //mapping the select_id to pos of pool
@@ -411,6 +621,26 @@ ggml_tensor * custom_moe_unified::get_downs(struct ggml_context * ctx, uint32_t 
     }
 }
 
+void custom_moe_unified::routers_init(){
+    if (routers_all == nullptr) {
+        return;
+    }
+    const size_t nb_router = ggml_nbytes(router(0));
+    const size_t nb_bias   = hparams.n_expert * sizeof(float);
+    for (uint32_t il = 0; il < moe_layer_count(); il++) {
+        ggml_tensor * r = router(il);
+        GGML_ASSERT(r->type == routers_all->type && ggml_nbytes(r) == nb_router && ggml_is_contiguous(r));
+        ggml_backend_tensor_get(r, (char *) routers_all->data + il * nb_router, 0, nb_router);
+
+        ggml_tensor * b = router_bias(il);
+        GGML_ASSERT((b != nullptr) == (router_biases_all != nullptr) && "custom moe: router bias in some layers only");
+        if (b != nullptr) {
+            GGML_ASSERT(b->type == GGML_TYPE_F32 && ggml_nbytes(b) == nb_bias);
+            ggml_backend_tensor_get(b, (char *) router_biases_all->data + il * nb_bias, 0, nb_bias);
+        }
+    }
+}
+
 void custom_moe_unified::table_init(const llama_model & model,llama_model_loader & ml){
 
     custom_expert_table & table = this->table;
@@ -453,6 +683,8 @@ void custom_moe_unified::table_init(const llama_model & model,llama_model_loader
         for(uint32_t j = 0; j < n_col; j++){
             table.at(i,j).state    = initial_state;
             table.at(i,j).pos      = -1;
+            table.at(i,j).predicted = false;
+            table.at(i,j).prefetched = false;
 
             table.at(i,j).up.idx   = weight_ups->idx;
             table.at(i,j).up.offs  = weight_ups->offs   + j * nbyte_up;
@@ -472,18 +704,17 @@ uint32_t custom_moe_unified::get_padding() const {
 }
 
 void custom_moe_unified::_free_expert(uint32_t il,int32_t id){
+    GGML_ASSERT(!table.at(il,id).predicted);
     table.mark(il,id,expert_state::OnDisk,INVALID_POS);
-    manage.get()->erase(il,id);
-}
-void custom_moe_unified::_free_layer(uint32_t il){
-    table.mark_layer(il,expert_state::OnDisk,INVALID_POS);
-    manage.get()->erase_layer(il);
+    evict->erase(il,id);
 }
 
 void custom_moe_unified::load_expert(uint32_t il, int32_t id,llama_pos target_pos,io_mode mode){
+    GGML_ASSERT(target_pos >= 0);
     table.mark(il,id,expert_state::Loading,target_pos);
-    manage.get()->insert(il,id);
+    evict->insert(il,id);
     const auto & nbyte = table.layer_nbyte[il];
+    stats[cur_prefill ? 0 : 1].n_bytes += nbyte[0] + nbyte[1] + nbyte[2];
     char * dst_up   = static_cast<char*>(pool.up->data)   + target_pos * nbyte_slot_up;
     char * dst_gate = static_cast<char*>(pool.gate->data) + target_pos * nbyte_slot_gate;
     char * dst_down = static_cast<char*>(pool.down->data) + target_pos * nbyte_slot_down;
@@ -497,7 +728,8 @@ void custom_moe_unified::load_expert(uint32_t il, int32_t id,llama_pos target_po
         table.mark(il,id,expert_state::InMemory,INVALID_POS);// and, the pos of table.mark()(aka '0') is meaningless
     }else{//io::async
 
-        //submit async read
+        //submit async read, table.refresh() marks the expert InMemory when all 3 parts are done
+        table.mark_async(il,id);
         async_io.async_submit(table.map(il,id,submit_type::UP),   dst_up,   nbyte[0], table.at(il,id).up.offs);
         async_io.async_submit(table.map(il,id,submit_type::GATE), dst_gate, nbyte[1], table.at(il,id).gate.offs);
         async_io.async_submit(table.map(il,id,submit_type::DOWN), dst_down, nbyte[2], table.at(il,id).down.offs);
@@ -505,86 +737,35 @@ void custom_moe_unified::load_expert(uint32_t il, int32_t id,llama_pos target_po
 }
 
 
-/*load all data with a layer
+/*load all data with a layer, blocking (only used at model load)
 input:
     il:         the id of table_layer
     target_pos: the pos of pool load to
 */
-void custom_moe_unified::load_layer(uint32_t il, llama_pos target_pos,io_mode mode){
+void custom_moe_unified::load_layer(uint32_t il, llama_pos target_pos){
     table.mark_layer(il,expert_state::Loading,target_pos);
-    manage.get()->insert_layer(il);
+    evict->insert_layer(il, (int32_t) hparams.n_expert);
     const auto & nbyte = table.layer_nbyte[il];
-    //load data
-        //io::block
-    if(mode == io_mode::block){
-        //up
-        for(int32_t id = 0; id < static_cast<int32_t>(hparams.n_expert); id++){
-            async_io.block_read(static_cast<char*>(pool.up->data)   + (target_pos + id) * nbyte_slot_up,     nbyte[0],    table.at(il,id).up.offs);
-        }
-        //gate
-        for(int32_t id = 0; id < static_cast<int32_t>(hparams.n_expert); id++){
-            async_io.block_read(static_cast<char*>(pool.gate->data) + (target_pos + id) * nbyte_slot_gate,   nbyte[1],    table.at(il,id).gate.offs);
-        }
-        //down
-        for(int32_t id = 0; id < static_cast<int32_t>(hparams.n_expert); id++){
-            async_io.block_read(static_cast<char*>(pool.down->data) + (target_pos + id) * nbyte_slot_down,   nbyte[2],    table.at(il,id).down.offs);
-        }
-        table.mark_layer(il,expert_state::InMemory,INVALID_POS);
-    }else{//io::async
-        for(int32_t id = 0; id < static_cast<int32_t>(hparams.n_expert); id++){
-            int identity_index = table.map(il,id,submit_type::UP);
-            async_io.async_submit(identity_index,static_cast<char*>(pool.up->data)   + (target_pos + id) * nbyte_slot_up,   nbyte[0], table.at(il,id).up.offs);
-        };
-        for(int32_t id = 0; id < static_cast<int32_t>(hparams.n_expert); id++){
-            int identity_index = table.map(il,id,submit_type::GATE);
-            async_io.async_submit(identity_index,static_cast<char*>(pool.gate->data) + (target_pos + id) * nbyte_slot_gate, nbyte[1], table.at(il,id).gate.offs);
-        };
-        for(int32_t id = 0; id < static_cast<int32_t>(hparams.n_expert); id++){
-            int identity_index = table.map(il,id,submit_type::DOWN);
-            async_io.async_submit(identity_index,static_cast<char*>(pool.down->data) + (target_pos + id) * nbyte_slot_down, nbyte[2], table.at(il,id).down.offs);
-        };
+    //up
+    for(int32_t id = 0; id < static_cast<int32_t>(hparams.n_expert); id++){
+        async_io.block_read(static_cast<char*>(pool.up->data)   + (target_pos + id) * nbyte_slot_up,     nbyte[0],    table.at(il,id).up.offs);
     }
-
+    //gate
+    for(int32_t id = 0; id < static_cast<int32_t>(hparams.n_expert); id++){
+        async_io.block_read(static_cast<char*>(pool.gate->data) + (target_pos + id) * nbyte_slot_gate,   nbyte[1],    table.at(il,id).gate.offs);
+    }
+    //down
+    for(int32_t id = 0; id < static_cast<int32_t>(hparams.n_expert); id++){
+        async_io.block_read(static_cast<char*>(pool.down->data) + (target_pos + id) * nbyte_slot_down,   nbyte[2],    table.at(il,id).down.offs);
+    }
+    table.mark_layer(il,expert_state::InMemory,INVALID_POS);
 }
 
 bool custom_moe_unified::can_evict(uint32_t il, int32_t id, uint32_t cur_il){
-    // the experts of cur_il may already be mapped for this token, a loading expert has a read in flight
-    return il != cur_il && table.at(il,id).state == expert_state::InMemory;
-}
-
-// eviction for -mo 0: a random expert among the evictable ones
-llama_pos custom_moe_unified::free_random(uint32_t cur_il){
-    std::vector<std::pair<uint32_t, int32_t>> candidates;
-    for(uint32_t il = 0; il < table.row_size(); il++){
-        for(int32_t id = 0; id < table.col_size(); id++){
-            if(can_evict(il,id,cur_il)){
-                candidates.emplace_back(il,id);
-            }
-        }
-    }
-    if(candidates.empty()){
-        return -1;
-    }
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<size_t> dis(0, candidates.size() - 1);
-    auto [il, id] = candidates[dis(gen)];
-
-    llama_pos pos = table.at(il,id).pos;
-    _free_expert(il,id);
-    return pos;
-}
-
-// eviction for -mo 1: the least recently used evictable expert
-llama_pos custom_moe_unified::free_lru(uint32_t cur_il){
-    uint32_t il = 0;
-    int32_t  id = 0;
-    if(!manage.get()->victim([&](uint32_t l, int32_t e){ return can_evict(l,e,cur_il); }, il, id)){
-        return -1;
-    }
-
-    llama_pos pos = table.at(il,id).pos;
-    _free_expert(il,id);
-    return pos;
+    // the experts of cur_il may already be mapped for this token, a loading expert has a read in flight,
+    // a predicted expert waits for its layer (without this, lru would evict it before the finished layers)
+    const auto & e = table.at(il,id);
+    return il != cur_il && e.state == expert_state::InMemory && !e.predicted;
 }
 
 
@@ -683,102 +864,123 @@ std::string extra_copyname(const std::string& str) {
     return "";
 }
 
+// expert ids [n_ids, n_tokens] -> unique ids, in order of first use
+static std::vector<int32_t> unique_ids(const struct ggml_tensor * a, uint32_t n_expert){
+    const int32_t * data   = (const int32_t *) ggml_get_data(a);
+    const int64_t   stride = a->nb[1] / sizeof(int32_t);
+    std::vector<bool>    seen(n_expert, false);
+    std::vector<int32_t> ids;
+    for(int64_t i = 0; i < a->ne[1]; i++){
+        for(int64_t j = 0; j < a->ne[0]; j++){
+            const int32_t id = data[i*stride + j];
+            GGML_ASSERT(0 <= id && (uint32_t) id < n_expert);
+            if(!seen[id]){
+                seen[id] = true;
+                ids.push_back(id);
+            }
+        }
+    }
+    return ids;
+}
+
 // mapping the select_id to pos of pool
 void id_pos_map(struct ggml_tensor * dst , const struct ggml_tensor * a, const struct ggml_tensor * b, int ith, int nth,  void * userdata){
     GGML_ASSERT(userdata != nullptr);
     GGML_ASSERT(ggml_are_same_shape(dst, a));
     GGML_ASSERT(a->ne[2] == a->ne[3]);
     GGML_ASSERT(a->ne[2] == 1);
-    bool prefill = (a->ne[1] > 1);
     const int32_t       * a_data        = (int32_t *)ggml_get_data(a);
     int32_t             * dst_data      = (int32_t *)ggml_get_data(dst);
     runtime_ctx         * ctx           = (runtime_ctx *)userdata;
     custom_moe_unified  * moe_unified   = ctx->moe_unified;
     int                   il            = ctx->il;
-    auto manage = moe_unified->manage.get();
-    GGML_UNUSED(b); // only a graph dependency, the lru does not use the router probs
+    GGML_UNUSED(b); // only a graph dependency, the eviction policy does not use the router probs
 
-    ////////////////////
+    const int n_ids   = a->ne[0];
+    const int n_token = a->ne[1];
 
-    int n_ids   = a->ne[0];
-    int n_token = a->ne[1];
-    //wait to check layer state when prefill
-    static CallSync sync;
-    if(prefill){// parallel
-        //prefill check
-        sync.wait_initialization([&]{//only first thread will call
-        if(prefill)moe_unified->check_layer(il);
+    // load the experts of this layer used by any token, then record the uses in token order (lru access sequence)
+    auto load_and_use = [&]{
+        moe_unified->ensure(il, unique_ids(a, moe_unified->hparams.n_expert), n_token > 1);
+        for(int i = 0; i < n_token; i++){
+            for(int j = 0; j < n_ids; j++){
+                moe_unified->evict->use(il, a_data[i*(a->nb[1] / 4) + j]);
+            }
+        }
+    };
 
-        });
+    if(n_token > 1){// prefill: one thread loads, then all threads map
+        static CallSync sync;
+        sync.wait_initialization(load_and_use);
         const int dr = (n_token + nth - 1) / nth;
         const int ie0 = dr * ith;
         const int ie1 = MIN(ie0 + dr, n_token);
-        // the experts used by the last tokens of the prompt are marked as recently used, so decode keeps them
-        const int warmup_token = 30;
-        //mapping
         for(int i = ie0; i < ie1; i++){
             for(int j = 0; j < n_ids; j++){
-                const int32_t id = a_data[i*(a->nb[1] / 4) + j];
-                dst_data[i*(dst->nb[1] / 4) +j] = moe_unified->id_map(il,id);
-                if(i >= n_token - warmup_token) manage->use(il,id);
+                dst_data[i*(dst->nb[1] / 4) +j] = moe_unified->id_map(il,a_data[i*(a->nb[1] / 4) + j]);
             }
         }
 
         sync.mark_completion(nth);
-    } else{// no parallel
+    } else{// decode: too little work to split
         if(ith == 0){
-            for(int i = 0; i < n_ids; i++){
-                //check
-                moe_unified->check_expert(il,a_data[i]);
-                //record the use
-                manage->use(il,a_data[i]);
-                //mapping
-                dst_data[i] = moe_unified->id_map(il,a_data[i]);
+            load_and_use();
+            for(int j = 0; j < n_ids; j++){
+                dst_data[j] = moe_unified->id_map(il,a_data[j]);
             }
         }
     }
 }
 
+// ctx->il is the predicted (target) moe layer, the layer being computed is moe_unified->cur_il
+// what happens with the prediction depends on the strategy, see custom_moe_unified::on_predicted
 void custom_predict(struct ggml_tensor * dst , const struct ggml_tensor * top_k, int ith, int nth,  void * userdata){
     GGML_ASSERT(userdata != nullptr);
     GGML_UNUSED(dst);
     GGML_UNUSED(nth);
 
-    
-    const int32_t       * topk_data         = (int32_t *)ggml_get_data(top_k);
     runtime_ctx         * ctx               = (runtime_ctx *)userdata;
     custom_moe_unified  * moe_unified       = ctx->moe_unified;
-    uint32_t              il                = ctx->il;
 
-    // float             * dst_data      = (float *)ggml_get_data(dst);
-    const int64_t n_select = top_k->ne[0];
-    const int64_t n_tokens = top_k->ne[1];
-
-    if(ith == 0){
-        if(n_tokens == 1){//decode
-            for(int32_t i = 0; i < n_select;i++){
-                int32_t expert_id = topk_data[i];
-                if(moe_unified->predict_expert(il + 1,expert_id))
-                    break;
-            }
-        }else{//prefill
-            if(il == 0)return;
-            if((il >= moe_unified->hparams.n_layer() - moe_unified->hparams.n_layer_dense_lead -2))return;
-            //predict or prefetch the next layer
-            // if tail_il reached the last moe layer, all layers stay resident and there is nothing to prefetch
-            const bool all_layer_resident = moe_unified->params.tail_il >= moe_unified->hparams.n_layer() - moe_unified->hparams.n_layer_dense_lead;
-            // predict_layer frees head_il: it must not be the layer being computed (window of one layer)
-            const bool head_is_done = moe_unified->params.head_il < il;
-            if(!all_layer_resident && head_is_done && ((il <= moe_unified->params.n_prefetch_layers) || (il == moe_unified->params.tail_il -1))){
-                uint32_t head_il = moe_unified->params.head_il;
-                uint32_t tail_il = moe_unified->params.tail_il;
-                moe_unified->predict_layer(head_il,tail_il);
-                moe_unified->params.head_il = head_il + 1;
-                moe_unified->params.tail_il = tail_il + 1;
-                return;
-            }
-        }
+    if(ith != 0){
+        return;
     }
+    // unique ids in order of first use: for one token this is the top-k order
+    moe_unified->on_predicted(ctx->il, unique_ids(top_k, moe_unified->hparams.n_expert), top_k->ne[1] > 1);
+}
 
+// io-aware prefill: choose the layer to predict now, write its rows in routers_all
+void custom_frontier(struct ggml_tensor * dst, int ith, int nth, void * userdata){
+    GGML_ASSERT(userdata != nullptr);
+    GGML_UNUSED(nth);
 
+    runtime_ctx         * ctx           = (runtime_ctx *)userdata;
+    custom_moe_unified  * moe_unified   = ctx->moe_unified;
+
+    if(ith != 0){
+        return;
+    }
+    const int32_t target   = moe_unified->next_frontier();
+    // nothing to predict: any valid rows, custom_predict_frontier ignores the result
+    const int32_t layer    = target >= 0 ? target : ctx->il;
+    const int32_t n_expert = moe_unified->hparams.n_expert;
+    GGML_ASSERT(dst->type == GGML_TYPE_I32 && ggml_nelements(dst) == n_expert);
+    int32_t * rows = (int32_t *) dst->data;
+    for(int32_t j = 0; j < n_expert; j++){
+        rows[j] = layer * n_expert + j;
+    }
+}
+
+void custom_predict_frontier(struct ggml_tensor * dst , const struct ggml_tensor * top_k, int ith, int nth,  void * userdata){
+    GGML_ASSERT(userdata != nullptr);
+    GGML_UNUSED(dst);
+    GGML_UNUSED(nth);
+
+    runtime_ctx         * ctx           = (runtime_ctx *)userdata;
+    custom_moe_unified  * moe_unified   = ctx->moe_unified;
+
+    if(ith != 0 || moe_unified->frontier_target < 0){
+        return;
+    }
+    moe_unified->on_predicted((uint32_t) moe_unified->frontier_target, unique_ids(top_k, moe_unified->hparams.n_expert), true);
 }

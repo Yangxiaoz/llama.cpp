@@ -79,6 +79,7 @@
         }
     },
     { "name": "cpu-debug", "inherits": [ "linux-base","debug"] },
+    { "name": "cpu-release", "inherits": [ "linux-base","release"] },
 
     { "name": "x64-linux-gcc-debug", "inherits": [ "base", "x64-linux-gcc", "debug" ] },
     { "name": "x64-linux-gcc-release", "inherits": [ "base", "x64-linux-gcc", "release" ] },

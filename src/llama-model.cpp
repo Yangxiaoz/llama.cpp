@@ -3362,9 +3362,9 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
 #ifdef CUSTOM_MOE
-        /*.moe_memory_utilization      =*/(float)0.3,
-        /*.moe_enable_optimizations    =*/ false,
-        /*.n_prefetch_layers           =*/ 1,
+        /*.moe_mode                    =*/ LLAMA_MOE_MODE_ON_DEMAND,
+        /*.moe_pool_ratio              =*/ 0.3f,
+        /*.moe_io_queue                =*/ 0,
 #endif
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,

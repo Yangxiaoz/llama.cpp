@@ -371,11 +371,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         }
     #ifdef CUSTOM_MOE
         // init moe_table
-        float utilization = params.moe_memory_utilization;
-        bool enable_optimizations = params.moe_enable_optimizations;
-        uint32_t  n_prefetch_layers = params.n_prefetch_layers;
-        GGML_ASSERT(utilization >0 && utilization<1);
-        model->moe_unified.reset(new custom_moe_unified(*model,fname,ml,enable_optimizations,utilization,n_prefetch_layers));
+        GGML_ASSERT(params.moe_pool_ratio > 0 && params.moe_pool_ratio < 1);
+        model->moe_unified.reset(new custom_moe_unified(*model,fname,ml,params.moe_mode,params.moe_pool_ratio,params.moe_io_queue));
         model->moe_unified.get()->prefill_init();
     #endif
         return {0, model_ptr.release()};

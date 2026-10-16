@@ -1091,23 +1091,12 @@ struct llm_graph_context {
     //
 
 #ifdef CUSTOM_MOE
-    ggml_tensor * build_moe_ffn_predict(
-            ggml_cgraph * gf,
-             ggml_tensor * cur,
-             ggml_tensor * predict_inp,
-             ggml_tensor * exp_probs_b,
-      custom_moe_unified * moe_unified,
-                 int64_t   n_expert_used,
-            llama_expert_gating_func_type gating_op,
-                     int   il) const;
-
+    // the predicted layers come from moe_unified->predict_targets()
     ggml_tensor * build_moe_ffn_offload(
             ggml_cgraph * gf,
              ggml_tensor * cur,
              ggml_tensor * gate_inp,
              ggml_tensor * exp_probs_b,
-             ggml_tensor * predict_inp,
-             ggml_tensor * predict_probs_b,
       custom_moe_unified * moe_unified,
                  int64_t   n_expert,
                  int64_t   n_expert_used,

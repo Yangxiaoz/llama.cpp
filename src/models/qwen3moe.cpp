@@ -140,19 +140,10 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         cb(cur, "ffn_norm", il);
 
         #ifdef CUSTOM_MOE
-            ggml_tensor * predict = nullptr;
-            ggml_tensor * predict_probs_b = nullptr;
-            if((model.moe_unified->params.optimization) && ((uint32_t)il < hparams.n_layer()-1)) {
-            predict = model.layers[il + 1].ffn_gate_inp;
-            predict_probs_b = nullptr;
-            }
-
             ggml_tensor * moe_out =
                 build_moe_ffn_offload(gf,cur,
                         model.layers[il].ffn_gate_inp,
                         nullptr,
-                        predict,
-                        predict_probs_b,
                         model.moe_unified.get(),
                         n_expert, n_expert_used,
                         LLM_FFN_SILU, true,

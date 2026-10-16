@@ -15,9 +15,9 @@
 // ----------------------------------------------------------------------------
 
 struct custom_moe_params {
-    float    memory_utilization   = 0.46f; // fraction of the device memory used as the expert pool, 0 < F < 1
-    bool     enable_optimizations = false; // LRU-based expert replacement instead of random
-    uint32_t n_prefetch_layers    = 1;     // number of layers to prefetch ahead
+    llama_moe_mode mode             = LLAMA_MOE_MODE_IO_AWARE;
+    float          pool_ratio       = 0.46f; // fraction of the device memory used as the expert pool, 0 < F < 1
+    uint32_t       io_queue         = 0;     // io-aware mode: prefill predicts a new layer only while fewer experts are being read, 0 = experts per layer
 };
 
 enum custom_moe_arg {
@@ -30,11 +30,11 @@ enum custom_moe_arg {
 static custom_moe_arg custom_moe_parse_arg(int argc, char ** argv, int & i, custom_moe_params & moe) {
     const char * const arg = argv[i];
 
-    const bool is_mu = strcmp(arg, "-mu") == 0 || strcmp(arg, "--moe-memory-utilization") == 0;
-    const bool is_mp = strcmp(arg, "-mp") == 0 || strcmp(arg, "--moe-prefetch-layers")   == 0;
-    const bool is_mo = strcmp(arg, "-mo") == 0 || strcmp(arg, "--moe-optimizations")     == 0;
+    const bool is_mode  = strcmp(arg, "--moe-mode")       == 0;
+    const bool is_ratio = strcmp(arg, "--moe-pool-ratio") == 0;
+    const bool is_queue = strcmp(arg, "--moe-io-queue")   == 0;
 
-    if (!is_mu && !is_mp && !is_mo) {
+    if (!is_mode && !is_ratio && !is_queue) {
         return CUSTOM_MOE_ARG_IGNORED;
     }
     if (i + 1 >= argc) {
@@ -44,20 +44,28 @@ static custom_moe_arg custom_moe_parse_arg(int argc, char ** argv, int & i, cust
     const char * const value = argv[++i];
 
     try {
-        if (is_mu) {
-            moe.memory_utilization = std::stof(value);
-            // the model loader requires 0 < utilization < 1
-            if (!(moe.memory_utilization > 0.0f && moe.memory_utilization < 1.0f)) {
+        if (is_mode) {
+            if (strcmp(value, "on-demand") == 0) {
+                moe.mode = LLAMA_MOE_MODE_ON_DEMAND;
+            } else if (strcmp(value, "cross-layer") == 0) {
+                moe.mode = LLAMA_MOE_MODE_CROSS_LAYER;
+            } else if (strcmp(value, "io-aware") == 0) {
+                moe.mode = LLAMA_MOE_MODE_IO_AWARE;
+            } else {
                 return CUSTOM_MOE_ARG_INVALID;
             }
-        } else if (is_mp) {
-            const int n_layer = std::stoi(value);
-            if (n_layer < 0) {
+        } else if (is_ratio) {
+            moe.pool_ratio = std::stof(value);
+            // the model loader requires 0 < ratio < 1
+            if (!(moe.pool_ratio > 0.0f && moe.pool_ratio < 1.0f)) {
                 return CUSTOM_MOE_ARG_INVALID;
             }
-            moe.n_prefetch_layers = (uint32_t) n_layer;
         } else {
-            moe.enable_optimizations = std::stoi(value) != 0;
+            const int n = std::stoi(value);
+            if (n < 0) {
+                return CUSTOM_MOE_ARG_INVALID;
+            }
+            moe.io_queue = (uint32_t) n;
         }
     } catch (...) {
         return CUSTOM_MOE_ARG_INVALID;
@@ -68,16 +76,20 @@ static custom_moe_arg custom_moe_parse_arg(int argc, char ** argv, int & i, cust
 
 static void custom_moe_print_usage(void) {
     printf("\ncustom MoE offload options:\n");
-    printf("\n    -mu, --moe-memory-utilization F   fraction of the device memory used as the expert pool, 0 < F < 1 (default: 0.46)\n");
-    printf("\n    -mp, --moe-prefetch-layers N      number of layers to prefetch ahead (default: 1)\n");
-    printf("\n    -mo, --moe-optimizations 0|1      use LRU-based expert replacement (default: 0)\n");
+    printf("\n    --moe-mode MODE              expert loading mode (default: io-aware)\n");
+    printf("                                   on-demand:   load the experts in use when the layer runs, random eviction\n");
+    printf("                                   cross-layer: layer i predicts layer i+1, its loads overlap with the compute of layer i, LRU eviction\n");
+    printf("                                   io-aware:    prefill predicts the next unplanned layer with the latest input, paced by the IO queue, LRU eviction\n");
+    printf("\n    --moe-pool-ratio F           fraction of the device memory used as the expert pool, 0 < F < 1 (default: 0.46)\n");
+    printf("\n    --moe-io-queue N             io-aware: prefill predicts a new layer only while fewer than N experts are being read\n");
+    printf("                                   (default: 0 = the number of experts per layer)\n");
 }
 
 // write the custom options into the model parameters
 static void custom_moe_apply(const custom_moe_params & moe, llama_model_params & model_params) {
-    model_params.moe_memory_utilization   = moe.memory_utilization;
-    model_params.moe_enable_optimizations = moe.enable_optimizations;
-    model_params.n_prefetch_layers        = moe.n_prefetch_layers;
+    model_params.moe_mode             = moe.mode;
+    model_params.moe_pool_ratio       = moe.pool_ratio;
+    model_params.moe_io_queue         = moe.io_queue;
 
     // the on-demand expert loading reads the weights straight from the file,
     // so mmap has to be off - this is not a tunable, it is a requirement
@@ -233,8 +245,6 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "%s: error: the prompt is empty\n", __func__);
         return 1;
     }
-    // the offload path supports a single prefill ubatch only, so the prompt must not be split
-    ctx_params.n_ubatch = n_prompt;
 #endif
 
     llama_context * ctx = llama_init_from_model(model, ctx_params);
