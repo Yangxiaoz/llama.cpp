@@ -3365,6 +3365,7 @@ llama_model_params llama_model_default_params() {
         /*.moe_mode                    =*/ LLAMA_MOE_MODE_ON_DEMAND,
         /*.moe_pool_ratio              =*/ 0.3f,
         /*.moe_io_queue                =*/ 0,
+        /*.moe_decode_prefetch         =*/ 2,
         /*.moe_arpe_affinity           =*/ nullptr,
         /*.moe_arpe_calib              =*/ nullptr,
 #endif

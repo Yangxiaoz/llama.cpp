@@ -81,6 +81,7 @@ struct perf_time{
 struct custom_hparams {
     float           utilization       = 0.7f;
     uint32_t        io_queue          = 0;  // io-aware prefill: predict a new layer only while fewer experts are loading
+    uint32_t        decode_prefetch   = 0;  // io-aware decode: max experts prefetched per layer, 0 = every missing expert
     uint32_t        n_preload_layers  = 0;  // whole layers that fit in the pool, loaded at model load
     uint32_t        reserve_budget    = 0;  // max predicted (reserved) experts: n_slots - n_expert, keeps room for the current layer
 };
@@ -100,9 +101,10 @@ struct custom_strategy {
     custom_victim_kind  prefill_victim; // farthest_layer: the layer whose next use is the latest, see victim_farthest()
     custom_prefill_kind prefill;
     custom_decode_kind  decode;
+    uint32_t            decode_load;    // decode next_layer: max experts prefetched per layer, 0 = every missing expert
 };
 
-custom_strategy custom_strategy_for(enum llama_moe_mode mode);
+custom_strategy custom_strategy_for(enum llama_moe_mode mode, uint32_t decode_prefetch);
 const char *    custom_moe_mode_name(enum llama_moe_mode mode);
 
 struct custom_tensor_mmap{
@@ -543,7 +545,7 @@ struct runtime_ctx{
 
 class custom_moe_unified{
 public:
-    custom_moe_unified(const llama_model & model,const std::string & fname,llama_model_loader & ml,enum llama_moe_mode mode,float utilization,uint32_t io_queue,
+    custom_moe_unified(const llama_model & model,const std::string & fname,llama_model_loader & ml,enum llama_moe_mode mode,float utilization,uint32_t io_queue,uint32_t decode_prefetch,
                        const std::string & arpe_affinity, const std::string & arpe_calib);
     ~custom_moe_unified();
     //menbers

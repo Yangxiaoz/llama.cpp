@@ -18,6 +18,7 @@ struct custom_moe_params {
     llama_moe_mode mode             = LLAMA_MOE_MODE_IO_AWARE;
     float          pool_ratio       = 0.46f; // fraction of the device memory used as the expert pool, 0 < F < 1
     uint32_t       io_queue         = 0;     // io-aware mode: prefill predicts a new layer only while fewer experts are being read, 0 = experts per layer
+    uint32_t       decode_prefetch  = 2;     // io-aware mode: max experts prefetched per layer in decode, 0 = every missing expert
     std::string    arpe_affinity;            // io-aware mode: routing counts file for the ARPE affinity prior, empty = uniform
     std::string    arpe_calib;               // io-aware mode: add the routing counts of this run to this file, empty = off
 };
@@ -35,10 +36,11 @@ static custom_moe_arg custom_moe_parse_arg(int argc, char ** argv, int & i, cust
     const bool is_mode     = strcmp(arg, "--moe-mode")          == 0;
     const bool is_ratio    = strcmp(arg, "--moe-pool-ratio")    == 0;
     const bool is_queue    = strcmp(arg, "--moe-io-queue")      == 0;
+    const bool is_dpref    = strcmp(arg, "--moe-decode-prefetch") == 0;
     const bool is_affinity = strcmp(arg, "--moe-arpe-affinity") == 0;
     const bool is_calib    = strcmp(arg, "--moe-arpe-calib")    == 0;
 
-    if (!is_mode && !is_ratio && !is_queue && !is_affinity && !is_calib) {
+    if (!is_mode && !is_ratio && !is_queue && !is_dpref && !is_affinity && !is_calib) {
         return CUSTOM_MOE_ARG_IGNORED;
     }
     if (i + 1 >= argc) {
@@ -73,7 +75,11 @@ static custom_moe_arg custom_moe_parse_arg(int argc, char ** argv, int & i, cust
             if (n < 0) {
                 return CUSTOM_MOE_ARG_INVALID;
             }
-            moe.io_queue = (uint32_t) n;
+            if (is_dpref) {
+                moe.decode_prefetch = (uint32_t) n;
+            } else {
+                moe.io_queue = (uint32_t) n;
+            }
         }
     } catch (...) {
         return CUSTOM_MOE_ARG_INVALID;
@@ -92,6 +98,8 @@ static void custom_moe_print_usage(void) {
     printf("\n    --moe-pool-ratio F           fraction of the device memory used as the expert pool, 0 < F < 1 (default: 0.46)\n");
     printf("\n    --moe-io-queue N             io-aware: prefill predicts a new layer only while fewer than N experts are being read\n");
     printf("                                   (default: 0 = the number of experts per layer)\n");
+    printf("\n    --moe-decode-prefetch N      io-aware: max experts prefetched per layer in decode (default: 2, 0 = all missing)\n");
+    printf("                                   cross-layer always prefetches every missing expert of the next layer\n");
     printf("\n    --moe-arpe-affinity FILE     io-aware: routing counts for the ARPE affinity prior (default: none = uniform prior)\n");
     printf("\n    --moe-arpe-calib FILE        io-aware: add the routing counts of this run to FILE when the model is freed\n");
 }
@@ -102,6 +110,7 @@ static void custom_moe_apply(const custom_moe_params & moe, llama_model_params &
     model_params.moe_mode             = moe.mode;
     model_params.moe_pool_ratio       = moe.pool_ratio;
     model_params.moe_io_queue         = moe.io_queue;
+    model_params.moe_decode_prefetch  = moe.decode_prefetch;
     model_params.moe_arpe_affinity    = moe.arpe_affinity.empty() ? nullptr : moe.arpe_affinity.c_str();
     model_params.moe_arpe_calib       = moe.arpe_calib.empty()    ? nullptr : moe.arpe_calib.c_str();
 

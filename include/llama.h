@@ -359,6 +359,7 @@ extern "C" {
         enum llama_moe_mode moe_mode;
         float    moe_pool_ratio;       // fraction of the device memory used as the expert pool, 0 < F < 1
         uint32_t moe_io_queue;         // io-aware mode: prefill predicts a new layer only while fewer experts are being read, 0 = experts per layer
+        uint32_t moe_decode_prefetch;  // io-aware mode: max experts prefetched per layer in decode, 0 = every missing expert
         const char * moe_arpe_affinity; // io-aware mode: routing counts file for the ARPE affinity prior, NULL = uniform prior
         const char * moe_arpe_calib;    // io-aware mode: add the routing counts of this run to this file when the model is freed, NULL = off
 #endif

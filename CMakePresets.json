@@ -46,7 +46,23 @@
     { "name": "sycl_f16", "hidden": true, "cacheVariables": { "GGML_SYCL_F16":    "ON" } },
     { "name": "vulkan",   "hidden": true, "cacheVariables": { "GGML_VULKAN":      "ON" } },
     { "name": "cuda",       "hidden": true, "cacheVariables": { "GGML_CUDA":        "ON","CMAKE_CUDA_COMPILER": "/usr/local/cuda-12/bin/nvcc" } },
-    { "name": "jetson","hidden": true, "cacheVariables": { "CMAKE_CUDA_ARCHITECTURES": "87","GGML_CUDA_GRAPHS": "OFF" } },
+    {
+        "name": "jetson",
+        "inherits": [ "linux-base" ],
+        "cacheVariables": {
+            "CMAKE_BUILD_TYPE": "Release",
+            "GGML_CUDA": "ON",
+            "CMAKE_CUDA_COMPILER": "/usr/local/cuda/bin/nvcc",
+            "CMAKE_CUDA_ARCHITECTURES": "87",
+            "GGML_CUDA_GRAPHS": "OFF",
+            "LLAMA_BUILD_TESTS": "OFF",
+            "LLAMA_BUILD_TOOLS": "OFF",
+            "LLAMA_BUILD_SERVER": "OFF",
+            "LLAMA_BUILD_EXAMPLES": "ON",
+            "GGML_CCACHE": "ON",
+            "CMAKE_BUILD_PARALLEL_LEVEL": "4"
+        }
+    },
     {
         "name": "x64-windows-llvm", "hidden": true,
         "cacheVariables": {
@@ -109,5 +125,13 @@
 
     { "name": "x64-windows-vulkan-debug", "inherits": [ "base", "vulkan", "debug" ] },
     { "name": "x64-windows-vulkan-release", "inherits": [ "base", "vulkan", "release" ] }
+  ],
+  "buildPresets": [
+    {
+      "name": "jetson",
+      "configurePreset": "jetson",
+      "jobs": 4,
+      "targets": [ "llama-moe-offload" ]
+    }
   ]
 }

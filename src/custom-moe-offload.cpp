@@ -115,15 +115,16 @@ custom_expert_table::custom_expert_table(uint32_t n_moe_layer, uint32_t n_expert
 
 
 
-custom_strategy custom_strategy_for(enum llama_moe_mode mode){
+custom_strategy custom_strategy_for(enum llama_moe_mode mode, uint32_t decode_prefetch){
     switch (mode) {
         case LLAMA_MOE_MODE_ON_DEMAND:
-            return { io_mode::block, custom_evict_kind::random, custom_victim_kind::policy,         custom_prefill_kind::none,        custom_decode_kind::none       };
+            return { io_mode::block, custom_evict_kind::random, custom_victim_kind::policy,         custom_prefill_kind::none,        custom_decode_kind::none,       0 };
         case LLAMA_MOE_MODE_CROSS_LAYER:
-            return { io_mode::async, custom_evict_kind::lru,    custom_victim_kind::farthest_layer, custom_prefill_kind::cross_layer, custom_decode_kind::next_layer };
+            // decode prefetches every missing expert of the next layer
+            return { io_mode::async, custom_evict_kind::lru,    custom_victim_kind::farthest_layer, custom_prefill_kind::cross_layer, custom_decode_kind::next_layer, 0 };
         case LLAMA_MOE_MODE_IO_AWARE:
-            // the decode predictor reuses the cross-layer component for now, swap it here
-            return { io_mode::async, custom_evict_kind::arpe,   custom_victim_kind::farthest_layer, custom_prefill_kind::io_aware,    custom_decode_kind::next_layer };
+            // the decode predictor reuses the cross-layer component, but only prefetches what one layer can cover
+            return { io_mode::async, custom_evict_kind::arpe,   custom_victim_kind::farthest_layer, custom_prefill_kind::io_aware,    custom_decode_kind::next_layer, decode_prefetch };
     }
     GGML_ABORT("custom moe: unknown mode %d", (int) mode);
 }
@@ -137,11 +138,11 @@ const char * custom_moe_mode_name(enum llama_moe_mode mode){
     return "unknown";
 }
 
-custom_moe_unified::custom_moe_unified(const llama_model & model,const std::string & fname,llama_model_loader & ml,enum llama_moe_mode mode,float utilization,uint32_t io_queue,
+custom_moe_unified::custom_moe_unified(const llama_model & model,const std::string & fname,llama_model_loader & ml,enum llama_moe_mode mode,float utilization,uint32_t io_queue,uint32_t decode_prefetch,
                                        const std::string & arpe_affinity, const std::string & arpe_calib)
     : mode(mode),
-      strategy(custom_strategy_for(mode)),
-      params{utilization,io_queue,0,0},
+      strategy(custom_strategy_for(mode, decode_prefetch)),
+      params{utilization,io_queue,decode_prefetch,0,0},
       hparams(model.hparams),
       model(model),
       async_io(fname),
@@ -355,6 +356,9 @@ void custom_moe_unified::prefill_init(){
         custom_moe_mode_name(mode), params.n_preload_layers, params.reserve_budget);
     if (strategy.prefill == custom_prefill_kind::io_aware) {
         LLAMA_LOG_CONT(", io queue = %u experts", params.io_queue);
+    }
+    if (strategy.decode == custom_decode_kind::next_layer) {
+        LLAMA_LOG_CONT(", decode prefetch = %u experts/layer", strategy.decode_load);
     }
     LLAMA_LOG_CONT("\n");
 }
@@ -576,13 +580,20 @@ void custom_moe_unified::prefetch_frontier(uint32_t il, const std::vector<int32_
     }
 }
 
-// decode: the first predicted expert of layer il that is not in the pool
+// decode: prefetch the predicted experts of layer il that are not in the pool, up to strategy.decode_load (0 = all)
 void custom_moe_unified::predict_next_layer(uint32_t il, const std::vector<int32_t> & ids){
+    uint32_t n_load = 0;
     for(int32_t id : ids){
-        if(table.at(il,id).state == expert_state::OnDisk){
-            reserve_and_load(il,id,false);
-            return;
+        if(table.at(il,id).state != expert_state::OnDisk){
+            continue;
         }
+        if(strategy.decode_load > 0 && n_load >= strategy.decode_load){
+            break;
+        }
+        if(!reserve_and_load(il,id,false)){
+            break;
+        }
+        n_load++;
     }
 }
 
