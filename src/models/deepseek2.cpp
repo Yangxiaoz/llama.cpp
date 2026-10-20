@@ -655,6 +655,7 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
             #ifdef CUSTOM_MOE
                 ggml_tensor * moe_out =
                     build_moe_ffn_offload(gf,cur,
+                            inp_out_ids,
                             model.layers[il].ffn_gate_inp,
                             model.layers[il].ffn_exp_probs_b,
                             model.moe_unified.get(),

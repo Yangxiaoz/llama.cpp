@@ -1,12 +1,12 @@
-<｜begin▁of▁sentence｜>James creates a media empire. He creates a movie for $2000. Each DVD cost $6 to make. He sells it for 2.5 times that much. He sells 500 movies a day for 5 days a week. How much profit does he make in 20 weeks?
+<｜begin▁of▁sentence｜>James creates a media empire. He creates a movie for 000. Each DVD cost to make. He sells it for 2.5 times that much. He sells 500 movies a day for 5 days a week. How much profit does he make in 20 weeks?
+Answer:
+To solve the problem step by step, let's break down the information and calculations provided:
 
-To solve the problem step by step, let's break down the information and calculations:
+1. **Cost to make each DVD**: $0.50
+2. **Selling price per DVD**: $2.50 \times 0.50 = $1.25
+3. **Number of DVDs sold per day**: 500
+4. **Number of days per week the DVDs are sold**: 5
+5. **Number of weeks**: 20
 
-1. **Cost of creating the movie**: 
-   James spends $2000 to create the movie.
-
-2. **Cost to make each DVD**: 
-   Each DVD costs $6 to make.
-
-3. **Selling price of each DVD**: 
-   James sells each DVD for 2.5 times the cost to
+First, calculate the daily revenue:
+\[ \text{Daily revenue} = \

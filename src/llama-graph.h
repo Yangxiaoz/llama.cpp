@@ -1095,6 +1095,7 @@ struct llm_graph_context {
     ggml_tensor * build_moe_ffn_offload(
             ggml_cgraph * gf,
              ggml_tensor * cur,
+             ggml_tensor * out_ids, // inp_out_ids: rows computed by the last layer, may be empty
              ggml_tensor * gate_inp,
              ggml_tensor * exp_probs_b,
       custom_moe_unified * moe_unified,

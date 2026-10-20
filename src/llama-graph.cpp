@@ -1581,6 +1581,7 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
 ggml_tensor * llm_graph_context::build_moe_ffn_offload(
          ggml_cgraph * gf,
          ggml_tensor * cur,
+         ggml_tensor * out_ids, // inp_out_ids: rows computed by the last layer, may be empty
          ggml_tensor * gate_inp,
          ggml_tensor * exp_probs_b,
   custom_moe_unified * moe_unified,
@@ -1599,8 +1600,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn_offload(
     const uint32_t il_moe = il - hparams.n_layer_dense_lead;
 
     // router -> probs -> (+bias) -> top_k, shared by the real routing and the prediction of other layers
-    auto build_select = [&](ggml_tensor * router, ggml_tensor * router_b, ggml_tensor ** probs_out, const char * prefix) {
-        ggml_tensor * logits = build_lora_mm(router, cur); // [n_expert, n_tokens]
+    auto build_select = [&](ggml_tensor * x, ggml_tensor * router, ggml_tensor * router_b, ggml_tensor ** probs_out, const char * prefix) {
+        ggml_tensor * logits = build_lora_mm(router, x); // [n_expert, n_tokens]
         cb(logits, (std::string(prefix) + "_logits").c_str(), il);
 
         ggml_tensor * probs = nullptr;
@@ -1644,7 +1645,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn_offload(
     };
 
     ggml_tensor * probs = nullptr;
-    auto [selected_experts, selection_probs] = build_select(gate_inp, exp_probs_b, &probs, "ffn_moe");
+    auto [selected_experts, selection_probs] = build_select(cur, gate_inp, exp_probs_b, &probs, "ffn_moe");
 
     // expert id -> pool slot, loads the missing experts of this layer first
     ggml_tensor * select_map = ggml_map_custom2(ctx0, selected_experts, selection_probs, id_pos_map, 1, moe_unified->get_runtime_ctx(il_moe));
@@ -1653,8 +1654,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn_offload(
 
     // predict the experts of later layers from the input of this layer, the loads overlap with the compute
     // must come after select_map: id_pos_map sets moe_unified->cur_il, which the prediction protects from eviction
+    const uint32_t n_moe_layer = hparams.n_layer() - hparams.n_layer_dense_lead;
     for (uint32_t target : moe_unified->predict_targets(il_moe, n_tokens > 1)) {
-        ggml_tensor * predicted = build_select(moe_unified->router(target), moe_unified->router_bias(target), nullptr, "moe_predict").first;
+        ggml_tensor * pred_cur = cur;
+        if (n_tokens > 1 && target + 1 == n_moe_layer) {
+            // the last moe layer only feeds the output tokens: its input is cropped to them before the ffn
+            // (see the models), so predict from those rows only; with no output in this ubatch there is nothing to predict
+            if (out_ids != nullptr) {
+                if (ggml_is_empty(out_ids)) {
+                    continue;
+                }
+                pred_cur = ggml_get_rows(ctx0, cur, out_ids);
+            }
+        }
+        ggml_tensor * predicted = build_select(pred_cur, moe_unified->router(target), moe_unified->router_bias(target), nullptr, "moe_predict").first;
         ggml_tensor * none = ggml_map_custom1_inplace(ctx0, predicted, custom_predict, 1, moe_unified->get_runtime_ctx(target));
         cb(none, "moe_predict_none", il);
         ggml_build_forward_expand(gf, none);
@@ -1671,7 +1684,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn_offload(
         if (moe_unified->router_biases_all) {
             router_b = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, moe_unified->router_biases_all, rows), n_expert);
         }
-        ggml_tensor * predicted = build_select(router, router_b, nullptr, "moe_frontier").first;
+        ggml_tensor * predicted = build_select(cur, router, router_b, nullptr, "moe_frontier").first;
         ggml_tensor * none = ggml_map_custom1_inplace(ctx0, predicted, custom_predict_frontier, 1, moe_unified->get_runtime_ctx(il_moe));
         cb(none, "moe_frontier_none", il);
         ggml_build_forward_expand(gf, none);

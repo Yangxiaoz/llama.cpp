@@ -89,7 +89,7 @@ struct custom_hparams {
 // strategy: each llama_moe_mode is a combination of independent components, see strategy_for()
 // a new method is a new value of one component; changing one mode does not touch the others
 //
-enum class custom_evict_kind   { random, lru };
+enum class custom_evict_kind   { random, lru, arpe };
 enum class custom_victim_kind  { policy, farthest_layer };
 enum class custom_prefill_kind { none, cross_layer, io_aware };
 enum class custom_decode_kind  { none, next_layer };
@@ -312,6 +312,13 @@ public:
         }
     }
 
+    // a new ubatch starts: a prediction of a layer that never ran (an empty last layer) is stale
+    void clear_all_predicted(){
+        for(uint32_t row = 0; row < n_row; row++){
+            clear_predicted(row);
+        }
+    }
+
     int map(int row, int col,submit_type type) const{
         check_indices(row,col);
         return (row * n_col + col)*3 + static_cast<int>(type) + TABLE_SHIFT;
@@ -373,6 +380,14 @@ public:
     virtual void erase (uint32_t il, int32_t id) = 0; // the expert left the pool
     // an expert accepted by can_evict(il, id), return false if there is none
     virtual bool victim(const custom_evictable & can_evict, uint32_t & il, int32_t & id) = 0;
+
+    // optional hooks for policies that model the routing (ARPE), single threaded
+    // layer il starts and uses ids (unique), called before its missing experts are loaded
+    virtual void layer_begin(uint32_t /*il*/, const std::vector<int32_t> & /*ids*/, bool /*prefill*/) {}
+    // routing of layer il, ids[r*stride + k] for token r, after its experts are in memory and before the predictors run
+    virtual void observe(uint32_t /*il*/, const int32_t * /*ids*/, int64_t /*n_used*/, int64_t /*n_tokens*/, int64_t /*stride*/, bool /*prefill*/) {}
+    // true: no expert of the current layer is evictable, false: only the experts it uses are locked
+    virtual bool lock_layer() const { return true; }
 
     void insert_layer(uint32_t il, int32_t n_expert) {
         for (int32_t id = 0; id < n_expert; id++) {
@@ -528,7 +543,8 @@ struct runtime_ctx{
 
 class custom_moe_unified{
 public:
-    custom_moe_unified(const llama_model & model,const std::string & fname,llama_model_loader & ml,enum llama_moe_mode mode,float utilization,uint32_t io_queue);
+    custom_moe_unified(const llama_model & model,const std::string & fname,llama_model_loader & ml,enum llama_moe_mode mode,float utilization,uint32_t io_queue,
+                       const std::string & arpe_affinity, const std::string & arpe_calib);
     ~custom_moe_unified();
     //menbers
     const enum llama_moe_mode                   mode;
@@ -543,6 +559,9 @@ public:
     //
     size_t                                  total_size() const;
     void                                    prefill_init();//pre-load the initial some layer of moe_weight
+    // phase of the ubatch, decided at the first moe layer: the last layer of a prompt may see only the output tokens
+    bool                                    ubatch_prefill(uint32_t il, int64_t n_tokens);
+    bool                                    in_prefill() const { return cur_prefill; }
     // layer il starts: make the experts ids (unique) resident, returns when all are in memory
     void                                    ensure(uint32_t il, const std::vector<int32_t> & ids, bool prefill);
     // fixed moe layers to predict from the input of moe layer il, by strategy.prefill / strategy.decode
@@ -585,7 +604,9 @@ private:
     // io-aware prefill: the first moe layer whose experts are not predicted yet in this ubatch
     uint32_t                                frontier = 0;
     custom_moe_stats                        stats[2];       // 0: prefill, 1: decode
-    bool                                    cur_prefill = false; // phase of the current ubatch, set by ensure
+    bool                                    cur_prefill = false; // phase of the current ubatch, set by ubatch_prefill
+    bool                                    in_load = true;      // prefill_init still loading, the reads are not counted per phase
+    std::vector<uint8_t>                    cur_used;       // [n_expert] experts used by cur_il, set by ensure
     //
     //common
     //
@@ -595,10 +616,16 @@ private:
     uint32_t    moe_layer_count() const { return hparams.n_layer() - hparams.n_layer_dense_lead; }
     //
     void        _free_expert(uint32_t il,int32_t id);
+    // on-demand prefill: the whole layer enters the pool, whole layers are released to make room
+    void        ensure_layer(uint32_t il, const std::vector<int32_t> & ids);
+    bool        victim_layer(uint32_t & il); // the fully released layer whose next use is the farthest
+    void        free_layer(uint32_t il);     // release every resident expert of a layer, slots return to the pool
     void        load_expert(uint32_t il, int32_t id,llama_pos target_pos,io_mode mode);
     void        load_layer(uint32_t il, llama_pos target_pos);
     // an expert can be evicted if it is fully loaded, not in the layer being computed (cur_il) and not reserved by a prediction
     bool        can_evict(uint32_t il, int32_t id, uint32_t cur_il);
+    // same, but of cur_il only the experts it uses are locked (policies with lock_layer() == false)
+    bool        can_evict_unused(uint32_t il, int32_t id);
     // an evictable expert of a layer whose next use comes after target_il (cyclic layer order from cur_il), farthest first
     bool        victim_farthest(uint32_t target_il, uint32_t & il, int32_t & id);
     // a slot for an expert of target_il: a free slot, else evict one (prefill: strategy.prefill_victim, decode: evict policy)

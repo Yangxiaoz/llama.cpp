@@ -51,6 +51,7 @@ set(LLAMA_CORE_SOURCES
     llama-sampler.cpp
     llama-vocab.cpp
     custom-moe-offload.cpp
+    custom-moe-arpe.cpp
     unicode-data.cpp
     unicode.cpp
 )

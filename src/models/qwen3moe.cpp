@@ -142,6 +142,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         #ifdef CUSTOM_MOE
             ggml_tensor * moe_out =
                 build_moe_ffn_offload(gf,cur,
+                        inp_out_ids,
                         model.layers[il].ffn_gate_inp,
                         nullptr,
                         model.moe_unified.get(),

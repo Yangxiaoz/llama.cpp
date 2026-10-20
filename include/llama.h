@@ -322,7 +322,7 @@ extern "C" {
     enum llama_moe_mode {
         LLAMA_MOE_MODE_ON_DEMAND   = 0, // blocking loads of the experts in use, random eviction, no prediction
         LLAMA_MOE_MODE_CROSS_LAYER = 1, // prefill and decode: layer i predicts layer i+1, LRU
-        LLAMA_MOE_MODE_IO_AWARE    = 2, // prefill predicts one layer at a time with the latest input, paced by the IO queue, decode the next layer, LRU
+        LLAMA_MOE_MODE_IO_AWARE    = 2, // prefill predicts one layer at a time with the latest input, paced by the IO queue, decode the next layer, ARPE
     };
 #endif
 
@@ -359,6 +359,8 @@ extern "C" {
         enum llama_moe_mode moe_mode;
         float    moe_pool_ratio;       // fraction of the device memory used as the expert pool, 0 < F < 1
         uint32_t moe_io_queue;         // io-aware mode: prefill predicts a new layer only while fewer experts are being read, 0 = experts per layer
+        const char * moe_arpe_affinity; // io-aware mode: routing counts file for the ARPE affinity prior, NULL = uniform prior
+        const char * moe_arpe_calib;    // io-aware mode: add the routing counts of this run to this file when the model is freed, NULL = off
 #endif
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
