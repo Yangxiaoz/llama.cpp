@@ -187,7 +187,8 @@ class custom_async_io{
         if (mlock(r.cq.ring_ptr, r.cq.ring_sz)) {
             perror("mlock cq ring failed");
         }
-        if (mlock(r.sq.sqes, r.sq.ring_entries * sizeof(struct io_uring_sqe))) {
+        // kring_entries: the only entry count in liburing < 2.2 (2.5 deprecates it in favor of sq.ring_entries)
+        if (mlock(r.sq.sqes, (size_t) *r.sq.kring_entries * sizeof(struct io_uring_sqe))) {
             perror("mlock sqes failed");
         }
     }

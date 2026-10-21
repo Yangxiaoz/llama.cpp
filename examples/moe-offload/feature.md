@@ -171,6 +171,23 @@ cmake --build --preset jetson               # 只编 llama-moe-offload, 4 线程
 
 - preset `jetson` 继承 `linux-base`, 内容: `GGML_CUDA=ON`, `CMAKE_CUDA_ARCHITECTURES=87`, `GGML_CUDA_GRAPHS=OFF`, `CMAKE_BUILD_TYPE=Release`, `LLAMA_BUILD_TESTS/TOOLS/SERVER=OFF`, `LLAMA_BUILD_EXAMPLES=ON`, `GGML_CCACHE=ON`, build preset 的 `jobs = 4`, 只构建 `llama-moe-offload`.
 - `ENABLE_CUSTOM_MOE=ON` 和 `LLAMA_CURL=OFF` 继承自 `linux-base`.
+- 板子上的 CMake 太老时, `cmake --preset jetson` 会报 `Unrecognized "version" field`: preset 文件是 version 4, 需要 CMake >= 3.23 (JetPack 6 自带的 Ubuntu 22.04 是 3.22, 不够; JetPack 5 的 3.16 更不行). 两个办法:
+  1. 不用 preset, 直接传参数 (和 preset 等价):
+     ```bash
+     cmake -B build-jetson -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON \
+       -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -DCMAKE_CUDA_ARCHITECTURES=87 \
+       -DGGML_CUDA_GRAPHS=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=OFF \
+       -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_EXAMPLES=ON -DGGML_CCACHE=ON \
+       -DENABLE_CUSTOM_MOE=ON -DLLAMA_CURL=OFF
+     cmake --build build-jetson --target llama-moe-offload -j4
+     ```
+  2. 在板子上装一个新 CMake (项目本身只要求 3.14, 升级只为了用 preset):
+     ```bash
+     wget https://github.com/Kitware/CMake/releases/download/v3.28.3/cmake-3.28.3-linux-aarch64.tar.gz
+     tar xf cmake-3.28.3-linux-aarch64.tar.gz -C ~/.local/
+     export PATH=~/.local/cmake-3.28.3-linux-aarch64/bin:$PATH
+     cmake --version
+     ```
 - CUDA 编译器默认 `/usr/local/cuda/bin/nvcc` (JetPack 的标准位置). 不在那里时加 `-DCMAKE_CUDA_COMPILER=<路径>`.
 - 8 GB 内存不要提高并发: 6 核全开容易 OOM, 在 swap 上抖动会更慢.
 - 先验证 offload 逻辑时可以编纯 CPU 版:
@@ -305,6 +322,7 @@ cmake --build --preset jetson               # 只编 llama-moe-offload, 4 线程
 - 分开的原因: `block_read` 里的 `io_uring_wait_cqe` 会拿到**任意一个** CQE, 如果两种读共用一个 ring, 就可能吞掉异步读的完成事件.
 - 异步读带 `IOSQE_ASYNC`. 文件是普通的 buffered 读 (ext4, 没有 O_DIRECT). 不带这个标志时, 内核在 `io_uring_submit` 里先同步尝试读: page cache 里已有的数据 (相邻专家的预读、decode 时之前读过的专家) 当场拷贝; 没有的部分发起 128 KB 的预读, 之后的重试以 task_work 的形式在**提交线程**上执行. 提交线程是计算线程, 其他线程在屏障处等它, 所以这些拷贝实际上都在计算的关键路径上, "异步" 预取和按需读几乎没有区别. 带上之后, 读和拷贝都由内核的 io-wq 工作线程完成.
 - `refresh_completions(wait)`: 返回 `{user_data, 读到的字节数}`; `wait = true` 时先 `io_uring_wait_cqe` 睡眠, 不空转. `res < 0` 或 `user_data == 0` 时抛异常.
+- 兼容性: 只用 liburing 一直存在的接口. SQE 数组的 mlock 长度用 `*r.sq.kring_entries` (2.5 里标为 deprecated, 但 liburing < 2.2 只有它; 没有 `sq.ring_entries`). Ubuntu 22.04 / JetPack 6 自带的是 liburing 2.1.
 
 ### 4.6 自定义算子的 userdata `runtime_ctx` ([h:539](../../src/custom-moe-offload.h#L539))
 
@@ -580,3 +598,5 @@ prefill 和 decode 各一份, 模型释放时 (`~custom_moe_unified`) 打印一�
 - 2026-10-20: 第 2 节改写为可直接复制粘贴的测试手册: 2.1 三个构建的用途, 2.2 参数表, 2.3 变量和 `run()` 函数, 2.4 三种模式的命令, 2.5 正确性对比, 2.6 性能对比和统计解读, 2.7 长 prompt / 多 ubatch, 2.8 ARPE 标定流程, 2.9 常见问题.
 - 2026-10-20: CMakePresets 的 `jetson` preset 从隐藏的片段改为完整的 configure preset (CUDA sm_87, CUDA graphs 关, Release, tests/tools/server 关, ccache, 4 线程), 并新增同名 build preset (jobs = 4, 只编 `llama-moe-offload`). feature.md 新增 2.10 节.
 - 2026-10-20: decode 预测改为按缺失数预取: cross-layer 预取下一层全部缺失专家; io-aware 新增 `--moe-decode-prefetch N` (默认 2, 0 = 全部), 组件字段 `custom_strategy::decode_load`, `llama_model_params::moe_decode_prefetch`.
+- 2026-10-21: 记录 Jetson 上 CMake < 3.23 无法读取 version 4 的 preset (`Unrecognized "version" field`), 2.10 节补了等价的手工 cmake 命令和升级 CMake 的方法.
+- 2026-10-21: 修复 Jetson (liburing 2.1) 上的编译错误: `sq.ring_entries` 只有 liburing >= 2.2 才有, 改用 `*sq.kring_entries` 计算 SQE 数组长度.
