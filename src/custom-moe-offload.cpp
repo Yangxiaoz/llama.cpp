@@ -12,6 +12,7 @@
 #include <fstream>
 #include <iostream>
 #include <condition_variable>
+#include <cstdlib>
 
 
 // #include ""
@@ -185,10 +186,11 @@ custom_moe_unified::custom_moe_unified(const llama_model & model,const std::stri
     table_init(model,ml);
 
     //init the moe_pool
-    // the pool must be readable by the CPU (io_uring writes, custom ops) and by the device that runs the expert matmuls:
-    // with a GPU/iGPU this is its host buffer type (CUDA_Host), the iGPU of a unified memory system reads it in place
-    ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
-    // model.devices also holds an iGPU (e.g. Jetson), ggml_backend_dev_by_type(GPU) does not find it
+    // the pool is written by the CPU (io_uring) and read by the device that runs the expert matmuls.
+    // it lives in device memory: with managed allocations (GGML_CUDA_ENABLE_UNIFIED_MEMORY=1, cudaMallocManaged)
+    // the CPU can still write it, and the device reads it like any other device buffer.
+    // the iGPU must not read host mapped weights directly: ggml-cuda only handles that on the MMVQ path
+    // (batch <= 8), larger batches are corrupted (feature.md 6.5)
     ggml_backend_dev_t dev = model.devices.empty() ? nullptr : model.devices.front().dev;
 
     if (!dev) {
@@ -198,9 +200,14 @@ custom_moe_unified::custom_moe_unified(const llama_model & model,const std::stri
             throw std::runtime_error(format("%s: no CPU backend found", __func__));
         }
     }
-    auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
-    if(!host_buft){
-        host_buft = cpu_buft;
+    ggml_backend_buffer_type_t pool_buft = ggml_backend_dev_buffer_type(dev);
+    if (!pool_buft) {
+        pool_buft = ggml_backend_cpu_buffer_type();
+    }
+    const bool pool_host = ggml_backend_buft_is_host(pool_buft);
+    if (!pool_host && getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") == nullptr) {
+        throw std::runtime_error(format("%s: the expert pool would be in device memory, set GGML_CUDA_ENABLE_UNIFIED_MEMORY=1 "
+            "so that the CPU can write it (managed memory)", __func__));
     }
 
     ggml_backend_dev_props props;
@@ -267,22 +274,19 @@ custom_moe_unified::custom_moe_unified(const llama_model & model,const std::stri
 
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
-    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, host_buft);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, pool_buft);
     if (!buf) {
         throw std::runtime_error("failed to allocate buffer for moe_pool");
     }
     // this is used by ggml_backend_sched to improve op scheduling: ops that use a weight are preferably scheduled to the backend that contains the weight
     ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     bufs.emplace_back(buf);
-    if (ggml_backend_buffer_get_type(buf) != host_buft) {
-        // e.g. cudaMallocHost failed: the device cannot read the pool in place, expert matmuls copy it or run on the CPU
-        LLAMA_LOG_WARN("%s: moe_expert_pool fell back from %s to %s\n", __func__, ggml_backend_buft_name(host_buft), ggml_backend_buffer_name(buf));
-    }
 
     routers_init();
 
     LLAMA_LOG_INFO("n_slot of pool is:%d \n",n_slots);
-    LLAMA_LOG_INFO("%s: %10s moe_expert_pool buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+    LLAMA_LOG_INFO("%s: moe_expert_pool %s memory (%s), buffer size = %8.2f MiB\n", __func__, pool_host ? "host" : "device",
+        ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
 
     // the pre-load layer count is bounded by the model: a larger pool keeps every layer resident
     const uint32_t n_moe_layer = hparams.n_layer() - hparams.n_layer_dense_lead;
@@ -733,16 +737,20 @@ void custom_moe_unified::routers_init(){
     }
     const size_t nb_router = ggml_nbytes(router(0));
     const size_t nb_bias   = hparams.n_expert * sizeof(float);
+    // the pool buffer may be device memory: copy through the backend, never into tensor->data from the CPU
+    std::vector<char> tmp(std::max(nb_router, nb_bias));
     for (uint32_t il = 0; il < moe_layer_count(); il++) {
         ggml_tensor * r = router(il);
         GGML_ASSERT(r->type == routers_all->type && ggml_nbytes(r) == nb_router && ggml_is_contiguous(r));
-        ggml_backend_tensor_get(r, (char *) routers_all->data + il * nb_router, 0, nb_router);
+        ggml_backend_tensor_get(r, tmp.data(), 0, nb_router);
+        ggml_backend_tensor_set(routers_all, tmp.data(), il * nb_router, nb_router);
 
         ggml_tensor * b = router_bias(il);
         GGML_ASSERT((b != nullptr) == (router_biases_all != nullptr) && "custom moe: router bias in some layers only");
         if (b != nullptr) {
             GGML_ASSERT(b->type == GGML_TYPE_F32 && ggml_nbytes(b) == nb_bias);
-            ggml_backend_tensor_get(b, (char *) router_biases_all->data + il * nb_bias, 0, nb_bias);
+            ggml_backend_tensor_get(b, tmp.data(), 0, nb_bias);
+            ggml_backend_tensor_set(router_biases_all, tmp.data(), il * nb_bias, nb_bias);
         }
     }
 }

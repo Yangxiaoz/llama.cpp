@@ -167,6 +167,9 @@ run $R -m $DS -n 96 --moe-pool-ratio 0.15 --moe-mode io-aware --moe-arpe-affinit
 sudo apt install ccache liburing-dev        # 只需一次
 cmake --preset jetson
 cmake --build --preset jetson               # 只编 llama-moe-offload, 4 线程
+
+# 运行: 专家池在 managed 设备内存里, 必须设置这个环境变量
+export GGML_CUDA_ENABLE_UNIFIED_MEMORY=1
 ```
 
 - preset `jetson` 继承 `linux-base`, 内容: `GGML_CUDA=ON`, `CMAKE_CUDA_ARCHITECTURES=87`, `GGML_CUDA_GRAPHS=OFF`, `CMAKE_BUILD_TYPE=Release`, `LLAMA_BUILD_TESTS/TOOLS/SERVER=OFF`, `LLAMA_BUILD_EXAMPLES=ON`, `GGML_CCACHE=ON`, build preset 的 `jobs = 4`, 只构建 `llama-moe-offload`.
@@ -217,7 +220,7 @@ cmake --build --preset jetson               # 只编 llama-moe-offload, 4 线程
 | [src/llama-graph.cpp:1581](../../src/llama-graph.cpp#L1581) | `build_moe_ffn_offload`: 替代上游 `build_moe_ffn` 的建图函数, 包括预测; io-aware 的动态目标层节点在 [1677](../../src/llama-graph.cpp#L1677) |
 | [src/models/deepseek2.cpp:136-143](../../src/models/deepseek2.cpp#L136-L143), [655-680](../../src/models/deepseek2.cpp#L655-L680) | deepseek2: 专家张量加 flag; MoE 分支改调 `build_moe_ffn_offload` |
 | [src/models/qwen3moe.cpp:51-60](../../src/models/qwen3moe.cpp#L51-L60), [142-171](../../src/models/qwen3moe.cpp#L142-L171) | qwen3moe: 同上 |
-| [ggml/src/ggml-cuda/ggml-cuda.cu:308-313](../../ggml/src/ggml-cuda/ggml-cuda.cu#L308-L313) | 恢复 `integrated` 检测, 让 iGPU 直接在 CUDA_Host 上计算 (见第 6 节) |
+| [ggml/src/ggml-cuda/ggml-cuda.cu:310](../../ggml/src/ggml-cuda/ggml-cuda.cu#L310) | 保持上游的 `integrated = false`; CUSTOM_MOE 不再修改它, 池改用设备内存 (见第 6 节) |
 | [src/custom-moe-offload.h](../../src/custom-moe-offload.h) | 全部数据结构 + 部分 inline 实现 |
 | [src/custom-moe-offload.cpp](../../src/custom-moe-offload.cpp) | 核心逻辑 + 自定义 ggml 算子 (`id_pos_map`, `custom_predict`, `custom_frontier`, `custom_predict_frontier`) |
 | [src/custom-moe-arpe.h](../../src/custom-moe-arpe.h), [.cpp](../../src/custom-moe-arpe.cpp) | ARPE 淘汰策略 `custom_evict_arpe` (io-aware 的 decode), 见 5.7 |
@@ -244,7 +247,7 @@ cmake --build --preset jetson               # 只编 llama-moe-offload, 4 线程
 - 一个 "slot" = 一个专家的 up+gate+down. 对 up/gate/down 分别在所有 MoE 层中选**字节数最大**的专家张量作为模板, 池的类型和 `nbyte_slot_*` (`size_t`) 都取自它. 其他层的专家较小时, slot 末尾留空.
 - 专家可以放在任意 slot, 同一层的专家**不需要连续**: `mul_mat_id` 用 slot 下标直接在整个池张量上取专家 (见 5.2).
 - `n_slots = utilization * props.memory_total / nbyte_group`. `props` 来自 `model.devices.front()` (GPU 或 iGPU); 没有设备 (纯 CPU 构建) 时用 CPU device, 即系统内存. `n_slots < n_expert` 时抛异常: 最坏情况下一层的全部专家都会被用到.
-- buffer 类型: 该设备的 host buffer type (CUDA 下是 CUDA_Host), 没有就用 CPU buffer. 如果 CUDA_Host 分配失败, ggml 会退回普通 CPU buffer, 这时打印 warning. buffer usage 设为 `WEIGHTS`.
+- buffer 类型: 设备的默认 buffer type (`ggml_backend_dev_buffer_type(dev)`). CPU 构建是普通内存; CUDA 构建是**设备内存**, 需要 `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` (managed 分配) 才能让 CPU (io_uring) 也写它, 没设时构造直接报错. buffer usage 设为 `WEIGHTS`.
 - io-aware 模式下, 同一个 buffer 里还有 `routers_all` (所有 MoE 层的 router 按层拼接, `[n_embd, n_expert * n_moe_layer]`) 和 `router_biases_all` (有 `exp_probs_b` 时), 由 `routers_init` ([cpp:719](../../src/custom-moe-offload.cpp#L719)) 从模型权重复制. 用途见 5.2. 大小: DeepSeek-Lite 约 13 MB, Qwen3-30B 约 48 MB (F32 router).
 - `free_slots`: `std::map<pos, len>` 空闲区间表. `pool_alloc(n)` first-fit; `pool_free` 当前没有调用者. 实际的回收方式是: 淘汰一个专家后直接把它的 `pos` 交给新专家用.
 
@@ -513,17 +516,18 @@ prefill 和 decode 各一份, 模型释放时 (`~custom_moe_unified`) 打印一�
 
 ### 6.1 设计目标
 
-专家池必须**同时**被 CPU 和 iGPU 直接访问, 不能有拷贝:
-- CPU: io_uring 把专家从 SSD 读进池; 自定义算子 (CPU) 维护映射.
-- iGPU: `mul_mat_id` 直接读池里的专家.
+专家池必须**同时**被 CPU 和 iGPU 访问:
+- CPU: io_uring 把专家从 SSD 读进池.
+- iGPU: `mul_mat_id` 读池里的专家.
 
-做法: 池分配为 iGPU 设备的 host buffer type, 即 CUDA_Host (`cudaMallocHost` pinned 内存, 在 Linux 64 位 UVA 下 CPU 和 GPU 使用同一个指针). 物理上它就是同一块 DDR.
+做法: 池分配在**设备内存** (`ggml_backend_dev_buffer_type(dev)`), 运行时设置 `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1`, ggml-cuda 的设备分配改用 `cudaMallocManaged` (managed memory). managed 内存在 Linux 64 位 UVA 下 CPU 和 GPU 使用同一个指针, io_uring 可以直接写入, GPU 把它当普通设备 buffer 计算. Jetson 上物理上仍是同一块 DDR.
 
 ### 6.2 需要满足的条件和对应改动
 
-1. **找到 iGPU 设备**. Jetson 的 CUDA 设备类型是 `GGML_BACKEND_DEVICE_TYPE_IGPU`, `ggml_backend_dev_by_type(GPU)` 找不到它. 现在池和层的 device 都用 `model.devices.front()` (llama 在没有独显时会把 iGPU 放进 `devices`).
-2. **调度器把用到池的算子放到 iGPU 上, 并且不拷贝**. 调度器用 `ggml_backend_sched_backend_from_buffer` 选择第一个 `supports_buft(buffer) && supports_op` 的后端. CUDA 的 `supports_buft` 只有在 `integrated == true` 时才接受 CUDA_Host. 上游把 `integrated` 强制设成 false (#15034), 导致 decode 时使用池的 `MUL_MAT_ID` 在 CPU 上执行, prefill (batch >= 32) 时把**整个池**拷贝进 GPU 内存. 改动: 在 `#ifdef CUSTOM_MOE` 下恢复 `integrated = prop.integrated` ([ggml-cuda.cu:308-313](../../ggml/src/ggml-cuda/ggml-cuda.cu#L308-L313)). `integrated` 只影响 `supports_buft` 和 Debug 构建中的几条断言, 对独显没有影响.
-3. **非专家权重**放在 CUDA_Host (`cpu_buft_list` 的第一项), `integrated == true` 时同样由 iGPU 直接计算. KV cache 和计算 buffer 在 CUDA 设备内存中 (在 Jetson 上也是同一块 DDR).
+1. **找到 iGPU 设备**. Jetson 的 CUDA 设备类型是 `GGML_BACKEND_DEVICE_TYPE_IGPU`, `ggml_backend_dev_by_type(GPU)` 找不到它. 池和设备层都取 `model.devices.front()` (llama 在没有独显时会把 iGPU 放进 `devices`).
+2. **池在设备内存**. 调度器把用到池的 `MUL_MAT_ID` 调度到 iGPU, 没有拷贝, 也不需要 `integrated` 补丁 (上游保持 `false`, 见 6.5). 构造时检查: 如果池的 buffer type 不是 host 内存而 `GGML_CUDA_ENABLE_UNIFIED_MEMORY` 没有设置, 直接报错 (否则 io_uring 会写 cudaMalloc 的设备指针).
+3. **非专家权重**走上游路径: 放在设备的默认 buffer (`gpu_buft_list`), 也是 managed 内存. KV cache 和计算 buffer 同样在设备内存.
+4. `routers_all` / `router_biases_all` 也在池的 buffer 里, 初始化时用 `ggml_backend_tensor_set` 写入 (不能直接写 `tensor->data`).
 
 ### 6.3 CPU 写入和 GPU 读取的顺序
 
@@ -533,10 +537,25 @@ prefill 和 decode 各一份, 模型释放时 (`~custom_moe_unified`) 打印一�
 
 ### 6.4 风险与待验证
 
-- 上游关闭 `integrated` 的原因是 #15034 中的 "输出错误" (没能查到 issue 的具体内容). 在 Jetson 上需要对比 `ENABLE_CUSTOM_MOE=OFF` 的输出来确认.
-- 只在独显机器上做过编译检查, 还没有在 Jetson 上运行过.
-- `GGML_CUDA_NO_PINNED` 或 `cudaMallocHost` 失败时池会退回 CPU 内存, 加载时打印 warning, 这时又会出现拷贝.
+- managed 分配在这块板子上的正确性和性能还没有验证 (6.5).
+- `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` 会让所有设备分配 (权重、KV cache、计算 buffer) 都变成 managed; 在 Jetson 上它们本来就是同一块 DRAM, 预期没有额外开销, 需要用实测确认.
 - 每层都有 CPU 段, CUDA graph 用不上 (Jetson preset 已关闭).
+- 旧方案 (池放 CUDA_Host pinned 内存 + 恢复 `integrated`) 已废弃, 原因见 6.5.
+
+### 6.5 已知问题: iGPU 直接读 host 内存时 batch > 8 输出错误 (2026-10-21 定位)
+
+现象 (Jetson Orin Nano 8GB, JetPack 6.2 / L4T R36.4.3, CUDA 12.6, liburing 2.1):
+- prompt <= 8 token 输出正常, >= 9 token 开始输出 `!!!!` 这类乱码.
+- 与 `--moe-pool-ratio`、运行模式无关; `-ngl 0` (层全放 CPU) 也一样.
+
+定位过程:
+1. 把 ggml-cuda 里 CUSTOM_MOE 的 `integrated = prop.integrated` 临时改回 `false` (上游行为), 同样的 prompt 输出正确. 因此问题出在 "iGPU 直接访问 CUDA_Host 上的权重" 这条路径, 也就是上游 #15034 关闭 `integrated` 的原因.
+2. 边界正好是 8: 7/8 token 正常, 9 token 起出错. `ggml/src/ggml-cuda/mmvq.cuh` 里 `MMVQ_MAX_BATCH_SIZE == 8`: batch <= 8 时 `mul_mat_id` 走 MMVQ 内核 (能正确读 host 内存), batch > 8 走 MMQ / 其它路径 (读 host 内存得到错误结果).
+3. CUSTOM_MOE 下 `get_layer_buft_list` 让**所有层权重**都在 CUDA_Host, 不只专家池, 所以整个 prefill 都受影响.
+
+规避 (当前可用): 示例新增 `-ub N` (设置 `ctx_params.n_ubatch`), 在 Jetson 上用 `-ub 8`, 所有 ubatch <= 8, 走 MMVQ. 实测 DeepSeek-Lite / 66 token prompt: cross-layer prefill 4.6 t/s, io-aware 4.1 t/s, on-demand 1.1 t/s; decode 约 3 t/s (前几个 token 池是冷的). 代价: 每个 ubatch 都从第 0 层开始, 池小的时候 prefill 会重复读盘 (on-demand 最明显).
+
+**已实施的修改 (2026-10-21, 待板端验证)**: 按 6.1/6.2 的方案, 专家池改到设备内存 (managed 分配), 去掉 CUSTOM_MOE 的 `integrated` 补丁和 `get_layer_buft_list` 分支; 运行时要设置 `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1`. 预期不再有 host 权重被 iGPU 读取的问题, 可以去掉 `-ub 8`. 验证方法: 用同一段长 prompt 分别跑 "不带 -ub" 和 "带 -ub 8", 输出应完全一致; 若一致, 删除示例里的 `-ub` 参数.
 
 ## 7. 不变量 (排查问题时先检查这些)
 
@@ -600,3 +619,5 @@ prefill 和 decode 各一份, 模型释放时 (`~custom_moe_unified`) 打印一�
 - 2026-10-20: decode 预测改为按缺失数预取: cross-layer 预取下一层全部缺失专家; io-aware 新增 `--moe-decode-prefetch N` (默认 2, 0 = 全部), 组件字段 `custom_strategy::decode_load`, `llama_model_params::moe_decode_prefetch`.
 - 2026-10-21: 记录 Jetson 上 CMake < 3.23 无法读取 version 4 的 preset (`Unrecognized "version" field`), 2.10 节补了等价的手工 cmake 命令和升级 CMake 的方法.
 - 2026-10-21: 修复 Jetson (liburing 2.1) 上的编译错误: `sq.ring_entries` 只有 liburing >= 2.2 才有, 改用 `*sq.kring_entries` 计算 SQE 数组长度.
+- 2026-10-21: 定位 Jetson 上 batch > 8 输出乱码: CUSTOM_MOE 的 `integrated` 补丁让 iGPU 直接读 CUDA_Host 权重, 而 ggml-cuda 只有 MMVQ (batch <= 8) 能正确读 host 内存. 新增示例参数 `-ub` 作为规避 (`-ub 8`), 结论和根治方向写在 6.5.
+- 2026-10-21: 尝试 managed memory 方案: 专家池改用设备 buffer (`ggml_backend_dev_buffer_type`), 依赖 `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` 的 managed 分配让 CPU 仍可写; 撤销 `integrated` 补丁和 `get_layer_buft_list` 的 CUSTOM_MOE 分支; `routers_init` 改用 `ggml_backend_tensor_set`. 第 6 节重写, 2.10 加运行时的环境变量. 板端验证通过后删除示例的 `-ub` 参数.
