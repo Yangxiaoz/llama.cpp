@@ -10,192 +10,16 @@
 - 三种运行模式 (第 5 节): `on-demand` (基线), `cross-layer` (跨层预测), `io-aware` (IO 最大化, 本工程后续优化的核心).
 - 目标使用场景: 单用户. prompt 可以被拆成多个 ubatch, 也可以多轮对话. 不考虑 MTP、`llama-moe-cache`、合并的 `gate_up_exps` 张量等特殊情况.
 
-## 2. 编译与运行
+## 2. 附加文档 (local_memory/)
 
-开发分两个阶段:
-1. 当前阶段: 笔记本纯 CPU 构建, 硬件拓扑是 DDR 内存 + SSD. 独显 (4060) 属于 "CPU + 独立 GPU" 结构, 不在本特性的讨论范围内.
-2. 之后的阶段: Jetson 统一内存 (CUDA 构建, 设备类型是 IGPU), 见第 6 节.
+本文件只描述特性本身 (设计、数据结构、模式、不变量). 工程操作和修改记录拆到 `local_memory/`:
 
-### 2.1 编译
-
-```bash
-# 日常调试 / 查正确性 (Debug, -O0)
-cmake --preset cpu-debug
-cmake --build build-cpu-debug --target llama-moe-offload -j
-
-# 性能测试 (Release)
-cmake --preset cpu-release
-cmake --build build-cpu-release --target llama-moe-offload -j
-
-# Jetson 路径的编译检查
-cmake --build build-cuda-moe --target llama-moe-offload -j
-```
-
-| 构建 | 用途 |
+| 文件 | 内容 |
 |---|---|
-| `build-cpu-debug` | 查正确性. `-O0`, 计算慢很多倍, **不要**用它比较性能 |
-| `build-cpu-release` | 所有时间 / IO 对比都用它 |
-| `build-cuda-moe` | Jetson 路径的编译检查, 还没在设备上运行过 |
-
-- 改源码后**必须重新编译**再测: 旧二进制曾造成过一次误报.
-- `ENABLE_CUSTOM_MOE=ON` -> `add_compile_definitions(CUSTOM_MOE)`, 全局生效, 包括 ggml (在 `add_subdirectory(ggml)` 之前定义).
-- 依赖 liburing (`sudo apt install liburing-dev`).
-- 示例没有 `-t` 参数, 使用默认线程数 (`GGML_DEFAULT_N_THREADS` = 4).
-
-### 2.2 运行参数
-
-示例参数只在 `examples/moe-offload` 里解析, 对应 `llama_model_params` 的同名字段:
-
-| 参数 | 字段 | 含义 |
-|---|---|---|
-| `--moe-mode on-demand\|cross-layer\|io-aware` | `moe_mode` | 运行模式, 示例默认 `io-aware` (库默认 `on-demand`) |
-| `--moe-pool-ratio F` | `moe_pool_ratio` | 专家池占 "设备总内存" 的比例, 0 < F < 1, 示例默认 0.46 (库默认 0.3). CPU 构建按系统内存总量计算, 例如 31 GB x 0.15 约为 4.7 GB. 池必须至少能放下一整层专家, 否则加载时报错 |
-| `--moe-io-queue N` | `moe_io_queue` | 只对 `io-aware` 有效: prefill 只在 "正在读盘的专家数 < N" 时才预测新的一层, 见 5.4. 默认 0 = 每层专家数 (DeepSeek-Lite 64, Qwen3 128) |
-| `--moe-decode-prefetch N` | `moe_decode_prefetch` | 只对 `io-aware` 有效: decode 每层最多预取几个缺失专家, 默认 2, 0 = 下一层所有缺失专家. `cross-layer` 固定为全部, 不看这个参数 |
-| `--moe-arpe-affinity FILE` | `moe_arpe_affinity` | 只对 `io-aware` 有效: ARPE 离线亲和先验 A0 的路由计数文件 (由 `--moe-arpe-calib` 生成), 见 5.7. 不给 = 均匀先验 |
-| `--moe-arpe-calib FILE` | `moe_arpe_calib` | 只对 `io-aware` 有效: 模型释放时把本次运行的相邻层路由计数累加进 FILE (标定用) |
-
-- 示例在 CUSTOM_MOE 下: `load_mode = LLAMA_LOAD_MODE_NONE` (不用 mmap); 空 prompt 直接报错.
-- 运行时约束:
-  - 一旦编译进 CUSTOM_MOE, **每次加载模型都走 offload 路径**, 没有运行时开关. 不是 deepseek2 / qwen3moe 的模型会在构造函数中触发断言.
-  - 只支持单文件 GGUF.
-
-### 2.3 测试准备 (把这段复制到同一个 shell)
-
-```bash
-cd ~/workspace/github/llama.cpp
-R=build-cpu-release/bin/llama-moe-offload
-D=build-cpu-debug/bin/llama-moe-offload
-DS=/home/shawn/models/DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf
-QW=/home/shawn/models/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf
-P='James creates a media empire. He creates a movie for $2000. Each DVD cost $6 to make. He sells it for 2.5 times that much. He sells 500 movies a day for 5 days a week. How much profit does he make in 20 weeks?'
-
-# run <命令...>: 清页缓存, 跑一次, 只打印关键行
-#   标准输出 -> t.out (打印的 prompt + 生成的文本), 标准错误 -> t.err (日志和统计)
-run() {
-    sync; echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null
-    "$@" > t.out 2> t.err
-    echo "exit=$?"
-    grep -E "custom_moe: mode|custom_moe stats|custom_moe ARPE|no room for a whole layer|GGML_ASSERT|error|prompt eval time|decoded" t.err
-}
-```
-
-- `run` 每次先清 page cache (`sudo tee`, 会要一次密码). 不清的话模型文件留在 page cache 里, 读盘其实是内存拷贝, IO 对比完全没意义 (实测 decode 能到 10 GB/s, 那是内存带宽).
-- prompt 用 ASCII 单引号: 双引号会被 shell 展开 `$2000`, 中文引号不会被当成引号.
-- 每次运行都覆盖 `t.out` / `t.err`, 需要对比时及时 `cp`.
-
-### 2.4 三种模式的测试命令
-
-```bash
-# 基线: prefill 按层加载/释放, decode 逐个专家, 不预测
-run $R -m $DS -n 96 --moe-pool-ratio 0.15 --moe-mode on-demand "$P"
-
-# 跨层预测: 第 i 层预测第 i+1 层, decode 预取下一层全部缺失专家
-run $R -m $DS -n 96 --moe-pool-ratio 0.15 --moe-mode cross-layer "$P"
-
-# IO 最大化: 前沿层预测 + ARPE decode 淘汰
-run $R -m $DS -n 96 --moe-pool-ratio 0.15 --moe-mode io-aware "$P"
-
-# io-aware: 改 IO 队列深度 (0 = 每层专家数)
-run $R -m $DS -n 96 --moe-pool-ratio 0.15 --moe-mode io-aware --moe-io-queue 32 "$P"
-
-# io-aware: decode 每层最多预取 2 个专家 (默认); 0 = 下一层全部都预取
-run $R -m $DS -n 96 --moe-pool-ratio 0.15 --moe-mode io-aware --moe-decode-prefetch 2 "$P"
-
-# Qwen3-30B: 每层 128 个专家, 池子用 0.2
-run $R -m $QW -n 96 --moe-pool-ratio 0.2 --moe-mode io-aware "$P"
-```
-
-- `--moe-pool-ratio 0.15` 在 31 GB 内存的机器上约 4.7 GB 池, DeepSeek-Lite 预加载 12 层 (日志第一行会打印 `n_slot of pool` 和预加载层数).
-- 三种模式用同一个 prompt 时, 生成结果应当完全一致 (见 2.5).
-
-
-### 2.5 性能对比
-
-看 `run` 打印的两类行:
-
-```
-llama_perf_context_print: prompt eval time = ... ms / ... tokens        <- prefill 总时间
-main: decoded 96 tokens in ... s, speed: ... t/s                        <- decode 速度
-custom_moe stats [prefill]: ... hit, ... wait, ... miss | prefetch N (used M) | read ... MiB | ensure ... ms, predict ... ms
-custom_moe stats [decode]:  ...
-```
-
-- `ensure` = 计算线程等这一层专家的总时间, 也就是没有被计算掩盖的 IO. `predict` = 预测器自身的时间 (同样在关键路径上).
-- `prompt eval time - ensure - predict` 约等于纯计算时间. 各模式应该接近; 如果 io-aware 明显更大, 说明后台 IO 拖慢了计算.
-- `miss` = 按需读的专家数; `prefetch (used)` = 预取数, 括号内是其中被用到的数. 命中率 = used / prefetch.
-- 单次测量有 1 秒左右的波动, 建议每条跑 2-3 次.
-- 换模型或换池大小时预加载层数会变, 对比必须在同一个 `--moe-pool-ratio` 下做.
-
-
-
-### 2.8 ARPE 标定
-
-ARPE 的亲和先验 A0 来自 "相邻两层路由" 的统计数据. 不标定也能跑 (A0 均匀), 标定只是让它从第一个 token 就有信息; 指南的结论是去掉离线先验平均少约 0.3 个百分点.
-
-```bash
-# 1) 用 3-5 条和评测无关的 prompt 标定; 每条都会把本次运行的计数累加进同一个文件
-run $R -m $DS -n 64 --moe-pool-ratio 0.15 --moe-mode io-aware --moe-arpe-calib /tmp/moe_test/ds.arpe 'Write a Python function that checks whether a string is a palindrome, ignoring spaces, punctuation and letter case, and explain how it works step by step.'
-run $R -m $DS -n 64 --moe-pool-ratio 0.15 --moe-mode io-aware --moe-arpe-calib /tmp/moe_test/ds.arpe 'Explain the difference between TCP and UDP, with one example use case for each. Keep the answer under 150 words.'
-run $R -m $DS -n 64 --moe-pool-ratio 0.15 --moe-mode io-aware --moe-arpe-calib /tmp/moe_test/ds.arpe 'Summarize the plot of Romeo and Juliet in five sentences.'
-
-# 2) 用标定结果跑评测 prompt
-run $R -m $DS -n 96 --moe-pool-ratio 0.15 --moe-mode io-aware --moe-arpe-affinity /tmp/moe_test/ds.arpe "$P"
-```
-
-- 标定文件在**模型释放时**写出 (正常退出). 每次会打印 `custom_moe ARPE: calibration counts written to ... (N pairs from this run, M in total)`.
-- 不要用评测的 prompt 去标定 (数据泄漏); 也不要只用一条 (样本太少).
-- 文件是模型相关的: 头里有 MoE 层数 / 专家数 / top-k. 不匹配时 `--moe-arpe-affinity` 打印 warning 并退回均匀先验, `--moe-arpe-calib` 不写入.
-- 大小: DeepSeek-Lite 约 0.8 MB, Qwen3-30B 约 6.2 MB. 删掉文件就等于清空标定.
-- prefill 和 decode 的 token 都会计入统计; 标定时的 `-n` 决定 decode 贡献多少.
-
-### 2.9 常见问题
-
-| 现象 | 原因 / 处理 |
-|---|---|
-| `error: the prompt is empty` | 没有传 prompt, 或 prompt 被 shell 吃掉; 用单引号 |
-| `moe pool too small` | `--moe-pool-ratio` 太小, 池放不下一整层 |
-| `no room for a whole layer, layer N is loaded expert by expert` | on-demand 的池被 decode 打散, 退化为一层内逐个专家加载; 输出正确, 只是性能略差 |
-| `GGML_ASSERT ...` | 先对照第 7 节的不变量, 把 `t.err` 末尾贴出来 |
-| 不同模式结果不一致 | 用同一构建、同一 prompt 复现; 确认没有用旧二进制 |
-
-### 2.10 Jetson 板端编译
-
-在 Orin Nano 8GB 上直接编译 (走的不是交叉编译, 见第 6 节):
-
-```bash
-sudo apt install ccache liburing-dev        # 只需一次
-cmake --preset jetson
-cmake --build --preset jetson               # 只编 llama-moe-offload, 4 线程
-
-# 运行: 专家池在 managed 设备内存里, 必须设置这个环境变量
-export GGML_CUDA_ENABLE_UNIFIED_MEMORY=1
-```
-
-- preset `jetson` 继承 `linux-base`, 内容: `GGML_CUDA=ON`, `CMAKE_CUDA_ARCHITECTURES=87`, `GGML_CUDA_GRAPHS=OFF`, `CMAKE_BUILD_TYPE=Release`, `LLAMA_BUILD_TESTS/TOOLS/SERVER=OFF`, `LLAMA_BUILD_EXAMPLES=ON`, `GGML_CCACHE=ON`, build preset 的 `jobs = 4`, 只构建 `llama-moe-offload`.
-- `ENABLE_CUSTOM_MOE=ON` 和 `LLAMA_CURL=OFF` 继承自 `linux-base`.
-- 板子上的 CMake 太老时, `cmake --preset jetson` 会报 `Unrecognized "version" field`: preset 文件是 version 4, 需要 CMake >= 3.23 (JetPack 6 自带的 Ubuntu 22.04 是 3.22, 不够; JetPack 5 的 3.16 更不行). 两个办法:
-  1. 不用 preset, 直接传参数 (和 preset 等价):
-     ```bash
-     cmake -B build-jetson -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON \
-       -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -DCMAKE_CUDA_ARCHITECTURES=87 \
-       -DGGML_CUDA_GRAPHS=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=OFF \
-       -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_EXAMPLES=ON -DGGML_CCACHE=ON \
-       -DENABLE_CUSTOM_MOE=ON -DLLAMA_CURL=OFF
-     cmake --build build-jetson --target llama-moe-offload -j4
-     ```
-  2. 在板子上装一个新 CMake (项目本身只要求 3.14, 升级只为了用 preset):
-     ```bash
-     wget https://github.com/Kitware/CMake/releases/download/v3.28.3/cmake-3.28.3-linux-aarch64.tar.gz
-     tar xf cmake-3.28.3-linux-aarch64.tar.gz -C ~/.local/
-     export PATH=~/.local/cmake-3.28.3-linux-aarch64/bin:$PATH
-     cmake --version
-     ```
-- CUDA 编译器默认 `/usr/local/cuda/bin/nvcc` (JetPack 的标准位置). 不在那里时加 `-DCMAKE_CUDA_COMPILER=<路径>`.
-- 8 GB 内存不要提高并发: 6 核全开容易 OOM, 在 swap 上抖动会更慢.
-- 先验证 offload 逻辑时可以编纯 CPU 版:
-  `cmake -B build-jetson-cpu -DGGML_CUDA=OFF -DGGML_CCACHE=ON -DENABLE_CUSTOM_MOE=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build-jetson-cpu --target llama-moe-offload -j4`.
-- 模型必须放在 NVMe SSD 上; eMMC / SD 卡的随机读会成为瓶颈, IO 数据没有参考价值.
+| [local_memory/build_and_run.md](local_memory/build_and_run.md) | 编译 (cpu-release / cpu-debug / cuda-moe / Jetson preset)、运行参数、测试命令、正确性 / 性能对比、长 prompt、ARPE 标定、常见问题 |
+| [local_memory/changelog.md](local_memory/changelog.md) | 修改记录 (按时间, 最新的在最后) |
+| [local_memory/jetson_host_memory.md](local_memory/jetson_host_memory.md) | Jetson 上 "iGPU 直接读 host 内存导致 batch > 8 输出错误" 的定位过程, 以及为什么放弃 CUDA_Host 和 managed 方案 |
+| [ARPE_施工指南.md](ARPE_施工指南.md) | ARPE 方法本身 (方法文档, 5.7 按它实现) |
 
 ## 3. 代码地图
 
@@ -220,7 +44,7 @@ export GGML_CUDA_ENABLE_UNIFIED_MEMORY=1
 | [src/llama-graph.cpp:1581](../../src/llama-graph.cpp#L1581) | `build_moe_ffn_offload`: 替代上游 `build_moe_ffn` 的建图函数, 包括预测; io-aware 的动态目标层节点在 [1677](../../src/llama-graph.cpp#L1677) |
 | [src/models/deepseek2.cpp:136-143](../../src/models/deepseek2.cpp#L136-L143), [655-680](../../src/models/deepseek2.cpp#L655-L680) | deepseek2: 专家张量加 flag; MoE 分支改调 `build_moe_ffn_offload` |
 | [src/models/qwen3moe.cpp:51-60](../../src/models/qwen3moe.cpp#L51-L60), [142-171](../../src/models/qwen3moe.cpp#L142-L171) | qwen3moe: 同上 |
-| [ggml/src/ggml-cuda/ggml-cuda.cu:310](../../ggml/src/ggml-cuda/ggml-cuda.cu#L310) | 保持上游的 `integrated = false`; CUSTOM_MOE 不再修改它, 池改用设备内存 (见第 6 节) |
+| [ggml/src/ggml-cuda/ggml-cuda.cu:310](../../ggml/src/ggml-cuda/ggml-cuda.cu#L310) | 保持上游的 `integrated = false`; CUSTOM_MOE 不再修改它 (见 6.5) |
 | [src/custom-moe-offload.h](../../src/custom-moe-offload.h) | 全部数据结构 + 部分 inline 实现 |
 | [src/custom-moe-offload.cpp](../../src/custom-moe-offload.cpp) | 核心逻辑 + 自定义 ggml 算子 (`id_pos_map`, `custom_predict`, `custom_frontier`, `custom_predict_frontier`) |
 | [src/custom-moe-arpe.h](../../src/custom-moe-arpe.h), [.cpp](../../src/custom-moe-arpe.cpp) | ARPE 淘汰策略 `custom_evict_arpe` (io-aware 的 decode), 见 5.7 |
@@ -247,7 +71,7 @@ export GGML_CUDA_ENABLE_UNIFIED_MEMORY=1
 - 一个 "slot" = 一个专家的 up+gate+down. 对 up/gate/down 分别在所有 MoE 层中选**字节数最大**的专家张量作为模板, 池的类型和 `nbyte_slot_*` (`size_t`) 都取自它. 其他层的专家较小时, slot 末尾留空.
 - 专家可以放在任意 slot, 同一层的专家**不需要连续**: `mul_mat_id` 用 slot 下标直接在整个池张量上取专家 (见 5.2).
 - `n_slots = utilization * props.memory_total / nbyte_group`. `props` 来自 `model.devices.front()` (GPU 或 iGPU); 没有设备 (纯 CPU 构建) 时用 CPU device, 即系统内存. `n_slots < n_expert` 时抛异常: 最坏情况下一层的全部专家都会被用到.
-- buffer 类型: 设备的默认 buffer type (`ggml_backend_dev_buffer_type(dev)`). CPU 构建是普通内存; CUDA 构建是**设备内存**, 需要 `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` (managed 分配) 才能让 CPU (io_uring) 也写它, 没设时构造直接报错. buffer usage 设为 `WEIGHTS`.
+- buffer 类型: 设备的默认 buffer type (`ggml_backend_dev_buffer_type(dev)`), CUDA 下是**设备内存**. buffer usage 设为 `WEIGHTS`. io_uring 不能直接写设备内存, 所以另有一块 host staging 环 (6.1).
 - io-aware 模式下, 同一个 buffer 里还有 `routers_all` (所有 MoE 层的 router 按层拼接, `[n_embd, n_expert * n_moe_layer]`) 和 `router_biases_all` (有 `exp_probs_b` 时), 由 `routers_init` ([cpp:719](../../src/custom-moe-offload.cpp#L719)) 从模型权重复制. 用途见 5.2. 大小: DeepSeek-Lite 约 13 MB, Qwen3-30B 约 48 MB (F32 router).
 - `free_slots`: `std::map<pos, len>` 空闲区间表. `pool_alloc(n)` first-fit; `pool_free` 当前没有调用者. 实际的回收方式是: 淘汰一个专家后直接把它的 `pos` 交给新专家用.
 
@@ -462,7 +286,7 @@ prefill 只加载这一层**实际用到的**专家. 每层平均用到的不同
 
 ### 5.5 decode
 
-decode 和 prefill 走同一个 `ensure`. on-demand: 逐个专家阻塞读 (decode 不整层), random 淘汰; cross-layer: 并行异步读 + 预取下一层全部缺失专家, LRU 淘汰; io-aware: 同样的预测器但每层最多预取 N 个 (2.2 的 `--moe-decode-prefetch`), ARPE 淘汰 (5.7).
+decode 和 prefill 走同一个 `ensure`. on-demand: 逐个专家阻塞读 (decode 不整层), random 淘汰; cross-layer: 并行异步读 + 预取下一层全部缺失专家, LRU 淘汰; io-aware: 同样的预测器但每层最多预取 N 个 (见 local_memory/build_and_run.md 的参数表), ARPE 淘汰 (5.7).
 
 ### 5.6 统计 (`custom_moe_stats`)
 
@@ -514,48 +338,49 @@ prefill 和 decode 各一份, 模型释放时 (`~custom_moe_unified`) 打印一�
 
 纯 CPU 构建时, 所有权重、专家池和 KV cache 都在系统内存中, 计算全部在 CPU 上, 本节不适用.
 
-### 6.1 设计目标
+### 6.1 设计目标与做法
 
-专家池必须**同时**被 CPU 和 iGPU 访问:
-- CPU: io_uring 把专家从 SSD 读进池.
-- iGPU: `mul_mat_id` 读池里的专家.
+专家池要被 GPU 读取, 而 CPU 要用 io_uring 写入, 两者不能直接共享同一块内存:
+- io_uring 只能写 host 内存.
+- iGPU 直接在 host 内存上计算时, batch > 8 的路径 (MMQ) 会读错 (6.5).
 
-做法: 池分配在**设备内存** (`ggml_backend_dev_buffer_type(dev)`), 运行时设置 `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1`, ggml-cuda 的设备分配改用 `cudaMallocManaged` (managed memory). managed 内存在 Linux 64 位 UVA 下 CPU 和 GPU 使用同一个指针, io_uring 可以直接写入, GPU 把它当普通设备 buffer 计算. Jetson 上物理上仍是同一块 DDR.
+做法 (设备池 + host staging):
+```
+SSD --io_uring--> host staging (pinned) --ggml_backend_tensor_set--> 设备池 (cudaMalloc) --> GPU 计算
+                  CPU 可写                     (CUDA 下是 H2D 拷贝 + 同步)
+```
+- 池分配在**设备内存**, GPU 走的是和上游相同的正常路径.
+- io_uring 的目标改为 staging 环里的一个槽; 一个专家的 up/gate/down 三块都到齐后, 由 `refresh` 的回调 `copy_expert_to_pool` 拷进池里的 slot, 然后才标记 `InMemory`.
+- CPU 构建 (x86) 没有真正的拷贝: 池和 staging 都是普通内存, `ggml_backend_tensor_set` 内部就是 memcpy.
 
 ### 6.2 需要满足的条件和对应改动
 
-1. **找到 iGPU 设备**. Jetson 的 CUDA 设备类型是 `GGML_BACKEND_DEVICE_TYPE_IGPU`, `ggml_backend_dev_by_type(GPU)` 找不到它. 池和设备层都取 `model.devices.front()` (llama 在没有独显时会把 iGPU 放进 `devices`).
-2. **池在设备内存**. 调度器把用到池的 `MUL_MAT_ID` 调度到 iGPU, 没有拷贝, 也不需要 `integrated` 补丁 (上游保持 `false`, 见 6.5). 构造时检查: 如果池的 buffer type 不是 host 内存而 `GGML_CUDA_ENABLE_UNIFIED_MEMORY` 没有设置, 直接报错 (否则 io_uring 会写 cudaMalloc 的设备指针).
-3. **非专家权重**走上游路径: 放在设备的默认 buffer (`gpu_buft_list`), 也是 managed 内存. KV cache 和计算 buffer 同样在设备内存.
-4. `routers_all` / `router_biases_all` 也在池的 buffer 里, 初始化时用 `ggml_backend_tensor_set` 写入 (不能直接写 `tensor->data`).
+1. **找到 iGPU 设备**. Jetson 的 CUDA 设备类型是 `GGML_BACKEND_DEVICE_TYPE_IGPU`, `ggml_backend_dev_by_type(GPU)` 找不到它. 池、staging 和层设备都取 `model.devices.front()`.
+2. **池在设备内存**. `ggml_backend_dev_buffer_type(dev)`; 调度器把用到池的 `MUL_MAT_ID` 放到 iGPU, 没有拷贝. 不再需要 `integrated` 补丁 (上游保持 false).
+3. **staging 环**. `ggml_backend_dev_host_buffer_type(dev)` (CUDA 下是 pinned 的 CUDA_Host) 分配 `n_stage x slot` 字节, 默认 `n_stage = 16` (DeepSeek-Lite 约 100 MB, Qwen3-30B 约 46 MB). 槽数同时限制并行读的专家数.
+4. **非专家权重**走上游路径, 在设备内存里初始化. KV cache 和计算 buffer 也在设备内存.
+5. `routers_all` / `router_biases_all` 在池的 buffer 里, 初始化用 `ggml_backend_tensor_set`.
 
-### 6.3 CPU 写入和 GPU 读取的顺序
+### 6.3 顺序与并发
 
-每层的图被切成 `GPU (router, top_k) -> CPU (id_pos_map, custom_predict) -> GPU (mul_mat_id ...)`. CPU 段开始前, 调度器要把 top_k 结果拷到 CPU, 这时 GPU 已经执行完前面所有的 kernel. 所以:
-- 被淘汰的 slot 只属于前面的层 (当前层受保护), 它们的 kernel 已经执行完, 可以安全覆盖.
-- 预测的异步读写入空闲 slot 或被淘汰的 slot, 不会和当前层的 `mul_mat_id` 冲突. 使用前 `ensure` 会等待读完成.
+每个专家的生命周期: 占一个 staging 槽 -> 读 (async 或 block) -> 拷进池的 slot -> `InMemory` -> 释放 staging 槽.
+- `Loading` 状态覆盖 "读 + 拷贝" 两个阶段; 这期间 pool slot 和 staging 槽都不能被复用或淘汰 (`can_evict` 只接受 `InMemory`).
+- 预取拿不到 staging 槽时直接放弃 (不影响当前层); 当前层按需加载时等待一个槽位释放 (`stage_alloc(wait = true)` 内部收割完成事件).
+- 每层的图被切成 `GPU (router, top_k) -> CPU (id_pos_map, custom_predict) -> GPU (mul_mat_id ...)`. CPU 段开始前调度器会同步; 拷贝在 CPU 段内完成, 后续 kernel 看到的是新数据.
+- 当前阶段 (阶段一) 的拷贝是同步的 (`ggml_backend_tensor_set` 内部 `cudaMemcpyAsync` + `cudaStreamSynchronize`), 会占用加载线程; 阶段二再改成异步拷贝 + 流顺序.
 
-### 6.4 风险与待验证
+### 6.4 代价与风险
 
-- managed 分配在这块板子上的正确性和性能还没有验证 (6.5).
-- `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` 会让所有设备分配 (权重、KV cache、计算 buffer) 都变成 managed; 在 Jetson 上它们本来就是同一块 DRAM, 预期没有额外开销, 需要用实测确认.
-- 每层都有 CPU 段, CUDA graph 用不上 (Jetson preset 已关闭).
-- 旧方案 (池放 CUDA_Host pinned 内存 + 恢复 `integrated`) 已废弃, 原因见 6.5.
+- **多一次内存拷贝** (staging -> 池). Jetson 上两者都在 DRAM, 单个 6 MB 专家约 0.3-0.6 ms; decode 每 token 若缺 100 个专家, 多 30-60 ms; prefill 每 ubatch 补 19 层 (约 7.3 GB), 多 0.5-1 s.
+- **staging 内存**: `n_stage x slot` (见 6.2).
+- **状态机更复杂**: 读、拷贝两阶段, staging 槽位分配, 拷贝完成前不能淘汰或复用.
+- **预取提前量变短**: 数据要等拷贝完成才可用, 有效预取窗口缩小; 拷贝还会和计算抢内存带宽.
+- 阶段一的同步拷贝会串行化加载线程, 预取的并行度受 `n_stage` 限制.
+- 还没有在板子上验证.
 
-### 6.5 已知问题: iGPU 直接读 host 内存时 batch > 8 输出错误 (2026-10-21 定位)
+### 6.5 为什么是设备池 + staging
 
-现象 (Jetson Orin Nano 8GB, JetPack 6.2 / L4T R36.4.3, CUDA 12.6, liburing 2.1):
-- prompt <= 8 token 输出正常, >= 9 token 开始输出 `!!!!` 这类乱码.
-- 与 `--moe-pool-ratio`、运行模式无关; `-ngl 0` (层全放 CPU) 也一样.
-
-定位过程:
-1. 把 ggml-cuda 里 CUSTOM_MOE 的 `integrated = prop.integrated` 临时改回 `false` (上游行为), 同样的 prompt 输出正确. 因此问题出在 "iGPU 直接访问 CUDA_Host 上的权重" 这条路径, 也就是上游 #15034 关闭 `integrated` 的原因.
-2. 边界正好是 8: 7/8 token 正常, 9 token 起出错. `ggml/src/ggml-cuda/mmvq.cuh` 里 `MMVQ_MAX_BATCH_SIZE == 8`: batch <= 8 时 `mul_mat_id` 走 MMVQ 内核 (能正确读 host 内存), batch > 8 走 MMQ / 其它路径 (读 host 内存得到错误结果).
-3. CUSTOM_MOE 下 `get_layer_buft_list` 让**所有层权重**都在 CUDA_Host, 不只专家池, 所以整个 prefill 都受影响.
-
-规避 (当前可用): 示例新增 `-ub N` (设置 `ctx_params.n_ubatch`), 在 Jetson 上用 `-ub 8`, 所有 ubatch <= 8, 走 MMVQ. 实测 DeepSeek-Lite / 66 token prompt: cross-layer prefill 4.6 t/s, io-aware 4.1 t/s, on-demand 1.1 t/s; decode 约 3 t/s (前几个 token 池是冷的). 代价: 每个 ubatch 都从第 0 层开始, 池小的时候 prefill 会重复读盘 (on-demand 最明显).
-
-**已实施的修改 (2026-10-21, 待板端验证)**: 按 6.1/6.2 的方案, 专家池改到设备内存 (managed 分配), 去掉 CUSTOM_MOE 的 `integrated` 补丁和 `get_layer_buft_list` 分支; 运行时要设置 `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1`. 预期不再有 host 权重被 iGPU 读取的问题, 可以去掉 `-ub 8`. 验证方法: 用同一段长 prompt 分别跑 "不带 -ub" 和 "带 -ub 8", 输出应完全一致; 若一致, 删除示例里的 `-ub` 参数.
+旧方案把池放在 CUDA_Host, 让 iGPU 原地读. 在 Jetson 上这条路径只在 batch <= 8 (MMVQ) 时正确, batch > 8 会输出 `!!!!`; managed 内存没有改变这一点, 而且 decode 慢约 35 倍. 所以把池放到设备内存, io_uring 先读进 host staging 再拷进池. 定位过程和实验数据见 [local_memory/jetson_host_memory.md](local_memory/jetson_host_memory.md).
 
 ## 7. 不变量 (排查问题时先检查这些)
 
@@ -575,7 +400,7 @@ prefill 和 decode 各一份, 模型释放时 (`~custom_moe_unified`) 打印一�
 
 ## 8. 未解决的问题
 
-- Jetson 路径 (第 6 节) 还没有运行验证, 见 6.4.
+- Jetson 路径 (第 6 节) 还没有运行验证, 见 6.4. 定位记录在 [local_memory/jetson_host_memory.md](local_memory/jetson_host_memory.md).
 - io-aware 只在层边界 (`custom_frontier`) 决定是否预测. 如果某一层计算时间很长, IO 队列可能在这一层中途读空. 要彻底解决需要后台线程, 暂不处理.
 - 预加载把池填满时, io-aware 的 IO 从第二个 MoE 层开始, 见 5.4.
 - `routers_all` 是 router 权重的一份拷贝 (DeepSeek-Lite 约 13 MB, Qwen3-30B 约 48 MB).
@@ -584,40 +409,3 @@ prefill 和 decode 各一份, 模型释放时 (`~custom_moe_unified`) 打印一�
 - prompt 长度不是 ubatch 的整数倍时, 最后剩下的 1 个 token 会单独成为一个 ubatch, 在 MoE 层 0 被判定为 decode (5.3), 按 decode 的加载和淘汰方式处理. 输出正确, 只是那一层不做 prefill 预测. 例: 513 token = 512 + 1.
 - 专家大小不一致导致池有约 7%-9% 的浪费 (按测试模型估算). 暂不处理.
 - 已知限制 (不在目标场景内): 分片 GGUF (只打开一个 fd); 合并的 `gate_up_exps` 张量; deepseek2 的 MTP 层; 专家张量没有 buffer, 依赖 `tensor->buffer` 的上游功能 (memory breakdown, `common_fit_params`, `llama-moe-cache`) 行为未知.
-
-## 9. 变更记录
-- 2026-10-16: **三种运行模式 + IO-Aware prefill + 参数改名**:
-  - 新增 `enum llama_moe_mode` (on-demand / cross-layer / io-aware). 每个模式 = `custom_strategy` 中四个独立组件 (load, evict, prefill, decode) 的组合, 映射只在 `custom_strategy_for` 中.
-  - 淘汰策略改为接口 `custom_evict_policy`, 实现 `custom_evict_lru` 和 `custom_evict_random` (原来的 `custom_expert_manage`、`free_lru`、`free_random` 删除).
-  - io-aware prefill: MoE 层 0 预测所有后续层, 由泵在预约上限内按层顺序持续加载; 泵在每层 `ensure` 结束时继续. cross-layer prefill 改为纯跨层预测 (每层只预测第 il+D 层, 不再在层 0 填充第 1..D-1 层).
-  - 所有预测器统一通过 `reserve_and_load`, 预约总数上限 `reserve_budget = n_slots - n_expert`, 保证当前层总有位置 (原来的不死锁论证依赖 D 的截断, 现在对所有模式成立).
-  - on-demand 改为逐个专家阻塞读 (原来的 `-mo 0` 也是并行异步读).
-  - 异步 ring 的 CQ 增大到 32768.
-  - 参数改名: `-mo` / `-mu` / `-mp` -> `--moe-mode` / `--moe-pool-ratio` / `--moe-predict-distance`; `llama_model_params` 的字段改为 `moe_mode` / `moe_pool_ratio` / `moe_predict_distance`.
-- 2026-10-16: **io-aware prefill 改为前沿层预测 + IO 节奏; prefill 淘汰改为按层距离**:
-  - 删除 "层 0 一次性预测所有层" 和泵 (`io_plan`, `pump`). 改为每层用最新的 `cur` 只预测一层 (前沿层); IO 队列 >= Q 时跳过, 由后面的层用更新的 `cur` 预测; 放不下时下一层重试. 新参数 `--moe-io-queue` / `moe_io_queue`.
-  - 运行时选择目标层: 新增 `routers_all` / `router_biases_all`, 自定义算子 `custom_frontier` 和 `custom_predict_frontier`.
-  - 新组件 `prefill_victim`: cross-layer 和 io-aware 在 prefill 时按层距离淘汰 (`victim_farthest`), 刚算完的层最先被淘汰, 预取只淘汰比目标层更远的专家. 原因是 LRU 在 prefill 中会先淘汰马上要用的预加载层.
-  - 专家表新增 `n_resident`.
-- 2026-10-16: cross-layer 的 prefill 预测距离固定为 1 (第 i 层预测第 i+1 层). 删除参数 `--moe-predict-distance` / `moe_predict_distance` 和 `custom_hparams::predict_distance`.
-- 2026-10-16: 新增统计 `custom_moe_stats` (5.6) 和 Release 构建 preset `cpu-release`. 用户在 Debug 构建上测得 cross-layer / io-aware 的 prefill 比 on-demand 慢 (on-demand 12.2 s, cross-layer 12.5 s, io-aware 14.7 s, DeepSeek-Lite, pool 0.15, 66 token), decode 三者接近. 原因待用 Release 构建 + 统计确认.
-- 2026-10-16: Release 构建的统计 (DeepSeek-Lite, pool 0.15, 66 token) 显示: prefill 的 `ensure` 只有 58 ms (cross-layer) / 102 ms (io-aware), 但 `predict` 有 755 / 649 ms; decode 的 `predict` 1161 ms 只预取了 2130 个专家 (每个约 0.55 ms, 相当于 memcpy 的速度). 结论: 预取的拷贝是在提交时同步完成的, 并没有和计算并行. 异步读改为带 `IOSQE_ASYNC` (4.5).
-- 2026-10-20: **io-aware 的 decode 淘汰改为 ARPE** (5.7):
-  - 新文件 `src/custom-moe-arpe.h/.cpp`: `custom_evict_arpe`; 新组件值 `custom_evict_kind::arpe`, `custom_strategy_for` 中 io-aware 的 `evict` 改为 arpe. cross-layer 仍是 LRU, on-demand 仍是 random.
-  - `custom_evict_policy` 新增可选钩子 `layer_begin` / `observe` / `lock_layer` (默认空 / 空 / true, LRU 和 random 的行为不变); 新增 `can_evict_unused` 和 `cur_used`.
-  - 修正 prefill / decode 的判断: 改为在 MoE 层 0 决定 (`ubatch_prefill`), 以前 prompt 最后一个 ubatch 的最后一层 (只有输出 token) 被当成 decode. 影响所有模式: 这一层现在按 prefill 统计, 用 prefill 的淘汰方式.
-  - 新参数 `--moe-arpe-affinity` / `--moe-arpe-calib` (`moe_arpe_affinity` / `moe_arpe_calib`), 用于离线亲和先验的标定和加载.
-  - 由于本会话的 shell 被安全检查拦截, 这一版先在没有编译的情况下写完, 之后编译修正: `n_expert_used` 是按层的函数, ARPE 的 K 取第一个 MoE 层的值, 并断言所有 MoE 层相同. `build-cpu-release` / `build-cpu-debug` / `build-cuda-moe` 均编译通过, 无警告.
-  - 差分验证 (指南 12.2) 和 ARPE 参数调优暂不做, 先用默认参数调通.
-- 2026-10-20: **最后一层的预测 + on-demand prefill 按层**:
-  - 最后一层预测只用输出行: `build_moe_ffn_offload` 新增 `out_ids` 参数 (模型的 `inp_out_ids`), 预测最后一个 MoE 层时用 `get_rows(cur, out_ids)`, 输出行为 0 时不预测. io-aware 的前沿层不把最后一层当目标. 修复: 整层白读, 以及没有输出 token 的 ubatch 里预约永远不清除.
-  - 新的 prefill ubatch 开始时 `clear_all_predicted`, 防止预约跨 ubatch 泄漏.
-  - on-demand 的 prefill 改为按层: `ensure_layer` 整层读入, `victim_layer` / `free_layer` 整层释放, `pool_free` 归并连续区间. decode 仍逐个专家.
-  - 三个构建 (cpu-release / cpu-debug / cuda-moe) 编译通过, 无警告.
-- 2026-10-20: 第 2 节改写为可直接复制粘贴的测试手册: 2.1 三个构建的用途, 2.2 参数表, 2.3 变量和 `run()` 函数, 2.4 三种模式的命令, 2.5 正确性对比, 2.6 性能对比和统计解读, 2.7 长 prompt / 多 ubatch, 2.8 ARPE 标定流程, 2.9 常见问题.
-- 2026-10-20: CMakePresets 的 `jetson` preset 从隐藏的片段改为完整的 configure preset (CUDA sm_87, CUDA graphs 关, Release, tests/tools/server 关, ccache, 4 线程), 并新增同名 build preset (jobs = 4, 只编 `llama-moe-offload`). feature.md 新增 2.10 节.
-- 2026-10-20: decode 预测改为按缺失数预取: cross-layer 预取下一层全部缺失专家; io-aware 新增 `--moe-decode-prefetch N` (默认 2, 0 = 全部), 组件字段 `custom_strategy::decode_load`, `llama_model_params::moe_decode_prefetch`.
-- 2026-10-21: 记录 Jetson 上 CMake < 3.23 无法读取 version 4 的 preset (`Unrecognized "version" field`), 2.10 节补了等价的手工 cmake 命令和升级 CMake 的方法.
-- 2026-10-21: 修复 Jetson (liburing 2.1) 上的编译错误: `sq.ring_entries` 只有 liburing >= 2.2 才有, 改用 `*sq.kring_entries` 计算 SQE 数组长度.
-- 2026-10-21: 定位 Jetson 上 batch > 8 输出乱码: CUSTOM_MOE 的 `integrated` 补丁让 iGPU 直接读 CUDA_Host 权重, 而 ggml-cuda 只有 MMVQ (batch <= 8) 能正确读 host 内存. 新增示例参数 `-ub` 作为规避 (`-ub 8`), 结论和根治方向写在 6.5.
-- 2026-10-21: 尝试 managed memory 方案: 专家池改用设备 buffer (`ggml_backend_dev_buffer_type`), 依赖 `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` 的 managed 分配让 CPU 仍可写; 撤销 `integrated` 补丁和 `get_layer_buft_list` 的 CUSTOM_MOE 分支; `routers_init` 改用 `ggml_backend_tensor_set`. 第 6 节重写, 2.10 加运行时的环境变量. 板端验证通过后删除示例的 `-ub` 参数.

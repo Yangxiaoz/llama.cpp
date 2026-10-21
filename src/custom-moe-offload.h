@@ -121,6 +121,7 @@ struct custom_expert_group{
     llama_pos pos;
     bool predicted; // loaded for a layer that is not computed yet: not evictable until that layer runs
     bool prefetched; // read by a predictor, cleared when its layer runs (stats only)
+    int32_t stage;  // staging slot while the read is in flight (async), -1 = none
 };
 struct custom_expert_pool{
     struct ggml_tensor *            up;
@@ -339,6 +340,9 @@ public:
     }
 
     // wait = true: sleep until at least one async read completes, requires loading_count() > 0
+    // called when all 3 parts of an expert arrived, before it is marked InMemory: move it into the pool
+    std::function<void(uint32_t, int32_t)> on_loaded;
+
     void refresh(class custom_async_io& async_io, bool wait = false){
         GGML_ASSERT(!wait || n_loading > 0);
         auto completions = async_io.refresh_completions(wait);
@@ -352,6 +356,9 @@ public:
             if (--pending_io[layer_id][expert_id] == 0) {
                 // all 3 parts are in the pool
                 GGML_ASSERT(experts[layer_id][expert_id].state == expert_state::Loading);
+                if (on_loaded) {
+                    on_loaded(layer_id, expert_id);
+                }
                 mark(layer_id,expert_id,expert_state::InMemory,INVALID_POS);
                 n_loading--;
             }
@@ -603,6 +610,11 @@ private:
     class   custom_expert_table             table;
     std::vector<ggml_context_ptr>           ctxs;
     std::vector<ggml_backend_buffer_ptr>    bufs;
+    // host staging: one slot per load in flight, io_uring reads into it, then it is copied into the device pool
+    ggml_backend_buffer_ptr                 staging_buf;
+    int32_t                                 n_stage = 0;
+    size_t                                  nbyte_stage_slot = 0;
+    std::vector<int32_t>                    stage_free;
     std::vector<runtime_ctx>                rt_ctxs;    // one per moe layer, never resized
     // io-aware prefill: the first moe layer whose experts are not predicted yet in this ubatch
     uint32_t                                frontier = 0;
@@ -625,6 +637,12 @@ private:
     void        free_layer(uint32_t il);     // release every resident expert of a layer, slots return to the pool
     void        load_expert(uint32_t il, int32_t id,llama_pos target_pos,io_mode mode);
     void        load_layer(uint32_t il, llama_pos target_pos);
+    // staging ring: a slot for a read in flight (wait = false returns -1 when all are busy)
+    int32_t     stage_alloc(bool wait);
+    void        stage_release(int32_t s);
+    char *      stage_ptr(int32_t s, int part);
+    // staging slot -> pool slot, synchronous (ggml_backend_tensor_set waits for the copy)
+    void        copy_expert_to_pool(uint32_t il, int32_t id, int32_t s);
     // an expert can be evicted if it is fully loaded, not in the layer being computed (cur_il) and not reserved by a prediction
     bool        can_evict(uint32_t il, int32_t id, uint32_t cur_il);
     // same, but of cur_il only the experts it uses are locked (policies with lock_layer() == false)

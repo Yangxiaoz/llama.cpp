@@ -1,0 +1,40 @@
+# 修改记录
+
+按时间排列, 最新的在最后. 设计本身的说明见 [feature.md](../feature.md).
+
+- 2026-10-16: **三种运行模式 + IO-Aware prefill + 参数改名**:
+  - 新增 `enum llama_moe_mode` (on-demand / cross-layer / io-aware). 每个模式 = `custom_strategy` 中四个独立组件 (load, evict, prefill, decode) 的组合, 映射只在 `custom_strategy_for` 中.
+  - 淘汰策略改为接口 `custom_evict_policy`, 实现 `custom_evict_lru` 和 `custom_evict_random` (原来的 `custom_expert_manage`、`free_lru`、`free_random` 删除).
+  - io-aware prefill: MoE 层 0 预测所有后续层, 由泵在预约上限内按层顺序持续加载; 泵在每层 `ensure` 结束时继续. cross-layer prefill 改为纯跨层预测 (每层只预测第 il+D 层, 不再在层 0 填充第 1..D-1 层).
+  - 所有预测器统一通过 `reserve_and_load`, 预约总数上限 `reserve_budget = n_slots - n_expert`, 保证当前层总有位置 (原来的不死锁论证依赖 D 的截断, 现在对所有模式成立).
+  - on-demand 改为逐个专家阻塞读 (原来的 `-mo 0` 也是并行异步读).
+  - 异步 ring 的 CQ 增大到 32768.
+  - 参数改名: `-mo` / `-mu` / `-mp` -> `--moe-mode` / `--moe-pool-ratio` / `--moe-predict-distance`; `llama_model_params` 的字段改为 `moe_mode` / `moe_pool_ratio` / `moe_predict_distance`.
+- 2026-10-16: **io-aware prefill 改为前沿层预测 + IO 节奏; prefill 淘汰改为按层距离**:
+  - 删除 "层 0 一次性预测所有层" 和泵 (`io_plan`, `pump`). 改为每层用最新的 `cur` 只预测一层 (前沿层); IO 队列 >= Q 时跳过, 由后面的层用更新的 `cur` 预测; 放不下时下一层重试. 新参数 `--moe-io-queue` / `moe_io_queue`.
+  - 运行时选择目标层: 新增 `routers_all` / `router_biases_all`, 自定义算子 `custom_frontier` 和 `custom_predict_frontier`.
+  - 新组件 `prefill_victim`: cross-layer 和 io-aware 在 prefill 时按层距离淘汰 (`victim_farthest`), 刚算完的层最先被淘汰, 预取只淘汰比目标层更远的专家. 原因是 LRU 在 prefill 中会先淘汰马上要用的预加载层.
+  - 专家表新增 `n_resident`.
+- 2026-10-16: cross-layer 的 prefill 预测距离固定为 1 (第 i 层预测第 i+1 层). 删除参数 `--moe-predict-distance` / `moe_predict_distance` 和 `custom_hparams::predict_distance`.
+- 2026-10-16: 新增统计 `custom_moe_stats` (5.6) 和 Release 构建 preset `cpu-release`. 用户在 Debug 构建上测得 cross-layer / io-aware 的 prefill 比 on-demand 慢 (on-demand 12.2 s, cross-layer 12.5 s, io-aware 14.7 s, DeepSeek-Lite, pool 0.15, 66 token), decode 三者接近. 原因待用 Release 构建 + 统计确认.
+- 2026-10-16: Release 构建的统计 (DeepSeek-Lite, pool 0.15, 66 token) 显示: prefill 的 `ensure` 只有 58 ms (cross-layer) / 102 ms (io-aware), 但 `predict` 有 755 / 649 ms; decode 的 `predict` 1161 ms 只预取了 2130 个专家 (每个约 0.55 ms, 相当于 memcpy 的速度). 结论: 预取的拷贝是在提交时同步完成的, 并没有和计算并行. 异步读改为带 `IOSQE_ASYNC` (4.5).
+- 2026-10-20: **io-aware 的 decode 淘汰改为 ARPE** (5.7):
+  - 新文件 `src/custom-moe-arpe.h/.cpp`: `custom_evict_arpe`; 新组件值 `custom_evict_kind::arpe`, `custom_strategy_for` 中 io-aware 的 `evict` 改为 arpe. cross-layer 仍是 LRU, on-demand 仍是 random.
+  - `custom_evict_policy` 新增可选钩子 `layer_begin` / `observe` / `lock_layer` (默认空 / 空 / true, LRU 和 random 的行为不变); 新增 `can_evict_unused` 和 `cur_used`.
+  - 修正 prefill / decode 的判断: 改为在 MoE 层 0 决定 (`ubatch_prefill`), 以前 prompt 最后一个 ubatch 的最后一层 (只有输出 token) 被当成 decode. 影响所有模式: 这一层现在按 prefill 统计, 用 prefill 的淘汰方式.
+  - 新参数 `--moe-arpe-affinity` / `--moe-arpe-calib` (`moe_arpe_affinity` / `moe_arpe_calib`), 用于离线亲和先验的标定和加载.
+  - 由于本会话的 shell 被安全检查拦截, 这一版先在没有编译的情况下写完, 之后编译修正: `n_expert_used` 是按层的函数, ARPE 的 K 取第一个 MoE 层的值, 并断言所有 MoE 层相同. `build-cpu-release` / `build-cpu-debug` / `build-cuda-moe` 均编译通过, 无警告.
+  - 差分验证 (指南 12.2) 和 ARPE 参数调优暂不做, 先用默认参数调通.
+- 2026-10-20: **最后一层的预测 + on-demand prefill 按层**:
+  - 最后一层预测只用输出行: `build_moe_ffn_offload` 新增 `out_ids` 参数 (模型的 `inp_out_ids`), 预测最后一个 MoE 层时用 `get_rows(cur, out_ids)`, 输出行为 0 时不预测. io-aware 的前沿层不把最后一层当目标. 修复: 整层白读, 以及没有输出 token 的 ubatch 里预约永远不清除.
+  - 新的 prefill ubatch 开始时 `clear_all_predicted`, 防止预约跨 ubatch 泄漏.
+  - on-demand 的 prefill 改为按层: `ensure_layer` 整层读入, `victim_layer` / `free_layer` 整层释放, `pool_free` 归并连续区间. decode 仍逐个专家.
+  - 三个构建 (cpu-release / cpu-debug / cuda-moe) 编译通过, 无警告.
+- 2026-10-20: 第 2 节改写为可直接复制粘贴的测试手册: 2.1 三个构建的用途, 2.2 参数表, 2.3 变量和 `run()` 函数, 2.4 三种模式的命令, 2.5 正确性对比, 2.6 性能对比和统计解读, 2.7 长 prompt / 多 ubatch, 2.8 ARPE 标定流程, 2.9 常见问题.
+- 2026-10-20: CMakePresets 的 `jetson` preset 从隐藏的片段改为完整的 configure preset (CUDA sm_87, CUDA graphs 关, Release, tests/tools/server 关, ccache, 4 线程), 并新增同名 build preset (jobs = 4, 只编 `llama-moe-offload`). feature.md 新增 2.10 节.
+- 2026-10-20: decode 预测改为按缺失数预取: cross-layer 预取下一层全部缺失专家; io-aware 新增 `--moe-decode-prefetch N` (默认 2, 0 = 全部), 组件字段 `custom_strategy::decode_load`, `llama_model_params::moe_decode_prefetch`.
+- 2026-10-21: 记录 Jetson 上 CMake < 3.23 无法读取 version 4 的 preset (`Unrecognized "version" field`), build_and_run.md 第 10 节补了等价的手工 cmake 命令和升级 CMake 的方法.
+- 2026-10-21: 修复 Jetson (liburing 2.1) 上的编译错误: `sq.ring_entries` 只有 liburing >= 2.2 才有, 改用 `*sq.kring_entries` 计算 SQE 数组长度.
+- 2026-10-21: 定位 Jetson 上的 `!!!!` 输出: CUSTOM_MOE 的 `integrated` 补丁让 iGPU 直接读 CUDA_Host 权重, 而 ggml-cuda 只有 MMVQ (batch <= 8) 能正确读 host 内存. 尝试 managed memory 无效且更慢. 结论写入 6.5. 同期给示例加了临时的 `-ub` 参数作为规避.
+- 2026-10-21: 实现 "设备池 + host staging" (阶段一, 正确性): 池用 `ggml_backend_dev_buffer_type` 放设备内存; 新增 staging 环 (`n_stage = 16`, pinned host), io_uring 写入 staging, `refresh` 的 `on_loaded` 回调把专家拷进池后再标记 `InMemory`; `routers_init` 改用 `ggml_backend_tensor_set`; `get_layer_buft_list` 和 ggml-cuda 的 `integrated` 恢复上游. 第 6 节重写. 阶段二 (异步拷贝) 待正确性验证后做.
+- 2026-10-21: 文档重组: feature.md 只保留特性描述 (设计、数据结构、模式、不变量); 编译运行、测试命令和常见问题移到 `local_memory/build_and_run.md`, 修改记录移到 `local_memory/changelog.md`, 6.5 的定位过程移到 `local_memory/jetson_host_memory.md`; feature.md 第 2 节改为文件索引.

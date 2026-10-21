@@ -12,7 +12,6 @@
 #include <fstream>
 #include <iostream>
 #include <condition_variable>
-#include <cstdlib>
 
 
 // #include ""
@@ -186,11 +185,12 @@ custom_moe_unified::custom_moe_unified(const llama_model & model,const std::stri
     table_init(model,ml);
 
     //init the moe_pool
-    // the pool is written by the CPU (io_uring) and read by the device that runs the expert matmuls.
-    // it lives in device memory: with managed allocations (GGML_CUDA_ENABLE_UNIFIED_MEMORY=1, cudaMallocManaged)
-    // the CPU can still write it, and the device reads it like any other device buffer.
-    // the iGPU must not read host mapped weights directly: ggml-cuda only handles that on the MMVQ path
-    // (batch <= 8), larger batches are corrupted (feature.md 6.5)
+    // the pool is read by the device that runs the expert matmuls, so it lives in device memory. io_uring cannot
+    // write device memory: the experts are read into a host staging ring first and then copied into the pool
+    // (copy_expert_to_pool). the iGPU must not read host mapped weights directly: ggml-cuda only handles that on
+    // the MMVQ path (batch <= 8), larger batches are corrupted (feature.md 6.5)
+    ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
+    // model.devices also holds an iGPU (e.g. Jetson), ggml_backend_dev_by_type(GPU) does not find it
     ggml_backend_dev_t dev = model.devices.empty() ? nullptr : model.devices.front().dev;
 
     if (!dev) {
@@ -202,12 +202,12 @@ custom_moe_unified::custom_moe_unified(const llama_model & model,const std::stri
     }
     ggml_backend_buffer_type_t pool_buft = ggml_backend_dev_buffer_type(dev);
     if (!pool_buft) {
-        pool_buft = ggml_backend_cpu_buffer_type();
+        pool_buft = cpu_buft;
     }
-    const bool pool_host = ggml_backend_buft_is_host(pool_buft);
-    if (!pool_host && getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") == nullptr) {
-        throw std::runtime_error(format("%s: the expert pool would be in device memory, set GGML_CUDA_ENABLE_UNIFIED_MEMORY=1 "
-            "so that the CPU can write it (managed memory)", __func__));
+    // the CPU writes the staging buffer (io_uring, copies): it has to be host memory
+    ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
+    if (!host_buft) {
+        host_buft = cpu_buft;
     }
 
     ggml_backend_dev_props props;
@@ -282,11 +282,31 @@ custom_moe_unified::custom_moe_unified(const llama_model & model,const std::stri
     ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     bufs.emplace_back(buf);
 
+    // staging ring: one slot per load in flight. n_stage bounds the number of parallel reads
+    nbyte_stage_slot = nbyte_slot_up + nbyte_slot_gate + nbyte_slot_down;
+    n_stage = 16;
+    staging_buf.reset(ggml_backend_buft_alloc_buffer(host_buft, (size_t) n_stage * nbyte_stage_slot));
+    if (!staging_buf) {
+        throw std::runtime_error("failed to allocate the staging buffer for moe_pool");
+    }
+    stage_free.resize(n_stage);
+    for (int32_t s = 0; s < n_stage; s++) {
+        stage_free[s] = s;
+    }
+    table.on_loaded = [this](uint32_t il, int32_t id) {
+        auto & e = table.at(il, id);
+        GGML_ASSERT(e.stage >= 0);
+        copy_expert_to_pool(il, id, e.stage);
+        stage_release(e.stage);
+        e.stage = -1;
+    };
+
     routers_init();
 
     LLAMA_LOG_INFO("n_slot of pool is:%d \n",n_slots);
-    LLAMA_LOG_INFO("%s: moe_expert_pool %s memory (%s), buffer size = %8.2f MiB\n", __func__, pool_host ? "host" : "device",
-        ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+    LLAMA_LOG_INFO("%s: %10s moe_expert_pool buffer size = %8.2f MiB, staging %d x %.2f MiB in %s memory\n", __func__,
+        ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0,
+        n_stage, nbyte_stage_slot/1024.0/1024.0, ggml_backend_buft_name(host_buft));
 
     // the pre-load layer count is bounded by the model: a larger pool keeps every layer resident
     const uint32_t n_moe_layer = hparams.n_layer() - hparams.n_layer_dense_lead;
@@ -531,6 +551,10 @@ void custom_moe_unified::ensure(uint32_t il, const std::vector<int32_t> & ids, b
         // submit all missing experts first, so the reads run in parallel
         for(int32_t id : ids){
             if(table.at(il,id).state == expert_state::OnDisk){
+                // a staging slot is needed for the read; the layers in use have priority over prefetches
+                while(stage_free.empty()){
+                    table.refresh(async_io, true);
+                }
                 load_expert(il,id,alloc_slot(il, true, prefill),io_mode::async);
             }
         }
@@ -553,6 +577,9 @@ bool custom_moe_unified::reserve_and_load(uint32_t il, int32_t id, bool prefill)
         return false;
     }
     if(e.state == expert_state::OnDisk){
+        if(stage_free.empty()){
+            return false; // no staging slot: a prefetch must not block the reads of the layers in use
+        }
         llama_pos pos = alloc_slot(il, false, prefill);
         if(pos == -1){
             return false;
@@ -798,6 +825,7 @@ void custom_moe_unified::table_init(const llama_model & model,llama_model_loader
             table.at(i,j).state    = initial_state;
             table.at(i,j).pos      = -1;
             table.at(i,j).predicted = false;
+            table.at(i,j).stage     = -1;
             table.at(i,j).prefetched = false;
 
             table.at(i,j).up.idx   = weight_ups->idx;
@@ -819,8 +847,52 @@ uint32_t custom_moe_unified::get_padding() const {
 
 void custom_moe_unified::_free_expert(uint32_t il,int32_t id){
     GGML_ASSERT(!table.at(il,id).predicted);
+    GGML_ASSERT(table.at(il,id).stage < 0 && "freed expert still holds a staging slot");
     table.mark(il,id,expert_state::OnDisk,INVALID_POS);
     evict->erase(il,id);
+}
+
+// a staging slot for one expert (up + gate + down). wait = false: -1 when every slot is in use
+int32_t custom_moe_unified::stage_alloc(bool wait){
+    while(1){
+        if(!stage_free.empty()){
+            const int32_t s = stage_free.back();
+            stage_free.pop_back();
+            return s;
+        }
+        if(!wait){
+            return -1;
+        }
+        // every staging slot is held by a read in flight: wait for one to complete (and be copied into the pool)
+        GGML_ASSERT(table.loading_count() > 0 && "custom moe: no staging slot can be freed");
+        table.refresh(async_io, true);
+    }
+}
+
+void custom_moe_unified::stage_release(int32_t s){
+    GGML_ASSERT(0 <= s && s < n_stage);
+    stage_free.push_back(s);
+}
+
+char * custom_moe_unified::stage_ptr(int32_t s, int part){
+    GGML_ASSERT(0 <= s && s < n_stage && 0 <= part && part < NUM_EXPERT);
+    size_t off = 0;
+    if(part == static_cast<int>(submit_type::GATE)){
+        off = nbyte_slot_up;
+    } else if(part == static_cast<int>(submit_type::DOWN)){
+        off = nbyte_slot_up + nbyte_slot_gate;
+    }
+    return static_cast<char*>(ggml_backend_buffer_get_base(staging_buf.get())) + (size_t) s * nbyte_stage_slot + off;
+}
+
+// the read finished into staging: move it into the pool slot (device memory on CUDA, tensor_set waits for the copy)
+void custom_moe_unified::copy_expert_to_pool(uint32_t il, int32_t id, int32_t s){
+    const llama_pos pos = table.at(il,id).pos;
+    GGML_ASSERT(pos >= 0);
+    const auto & nbyte = table.layer_nbyte[il];
+    ggml_backend_tensor_set(pool.up,   stage_ptr(s, static_cast<int>(submit_type::UP)),   (size_t) pos * nbyte_slot_up,   nbyte[0]);
+    ggml_backend_tensor_set(pool.gate, stage_ptr(s, static_cast<int>(submit_type::GATE)), (size_t) pos * nbyte_slot_gate, nbyte[1]);
+    ggml_backend_tensor_set(pool.down, stage_ptr(s, static_cast<int>(submit_type::DOWN)), (size_t) pos * nbyte_slot_down, nbyte[2]);
 }
 
 void custom_moe_unified::load_expert(uint32_t il, int32_t id,llama_pos target_pos,io_mode mode){
@@ -829,24 +901,27 @@ void custom_moe_unified::load_expert(uint32_t il, int32_t id,llama_pos target_po
     evict->insert(il,id);
     const auto & nbyte = table.layer_nbyte[il];
     stats[cur_prefill ? 0 : 1].n_bytes += nbyte[0] + nbyte[1] + nbyte[2];
-    char * dst_up   = static_cast<char*>(pool.up->data)   + target_pos * nbyte_slot_up;
-    char * dst_gate = static_cast<char*>(pool.gate->data) + target_pos * nbyte_slot_gate;
-    char * dst_down = static_cast<char*>(pool.down->data) + target_pos * nbyte_slot_down;
+    // io_uring reads into a staging slot, the data is copied into the pool afterwards
+    const int32_t s = stage_alloc(mode == io_mode::block);
+    GGML_ASSERT(s >= 0 && "custom moe: the caller must leave a staging slot free");
     //load data
         //io::block
     if(mode == io_mode::block){
-        async_io.block_read(dst_up,   nbyte[0], table.at(il,id).up.offs);
-        async_io.block_read(dst_gate, nbyte[1], table.at(il,id).gate.offs);
-        async_io.block_read(dst_down, nbyte[2], table.at(il,id).down.offs);
+        async_io.block_read(stage_ptr(s, static_cast<int>(submit_type::UP)),   nbyte[0], table.at(il,id).up.offs);
+        async_io.block_read(stage_ptr(s, static_cast<int>(submit_type::GATE)), nbyte[1], table.at(il,id).gate.offs);
+        async_io.block_read(stage_ptr(s, static_cast<int>(submit_type::DOWN)), nbyte[2], table.at(il,id).down.offs);
+        copy_expert_to_pool(il,id,s);
+        stage_release(s);
 
         table.mark(il,id,expert_state::InMemory,INVALID_POS);// and, the pos of table.mark()(aka '0') is meaningless
     }else{//io::async
 
-        //submit async read, table.refresh() marks the expert InMemory when all 3 parts are done
+        //submit async read, table.refresh() copies it into the pool and marks it InMemory when all 3 parts are done
+        table.at(il,id).stage = s;
         table.mark_async(il,id);
-        async_io.async_submit(table.map(il,id,submit_type::UP),   dst_up,   nbyte[0], table.at(il,id).up.offs);
-        async_io.async_submit(table.map(il,id,submit_type::GATE), dst_gate, nbyte[1], table.at(il,id).gate.offs);
-        async_io.async_submit(table.map(il,id,submit_type::DOWN), dst_down, nbyte[2], table.at(il,id).down.offs);
+        async_io.async_submit(table.map(il,id,submit_type::UP),   stage_ptr(s, static_cast<int>(submit_type::UP)),   nbyte[0], table.at(il,id).up.offs);
+        async_io.async_submit(table.map(il,id,submit_type::GATE), stage_ptr(s, static_cast<int>(submit_type::GATE)), nbyte[1], table.at(il,id).gate.offs);
+        async_io.async_submit(table.map(il,id,submit_type::DOWN), stage_ptr(s, static_cast<int>(submit_type::DOWN)), nbyte[2], table.at(il,id).down.offs);
     }
 }
 
@@ -863,19 +938,16 @@ void custom_moe_unified::load_layer(uint32_t il, llama_pos target_pos){
     if(!in_load){
         stats[cur_prefill ? 0 : 1].n_bytes += (size_t) hparams.n_expert * (nbyte[0] + nbyte[1] + nbyte[2]);
     }
-    //up
+    // one expert at a time: read into staging, copy into the pool
     for(int32_t id = 0; id < static_cast<int32_t>(hparams.n_expert); id++){
-        async_io.block_read(static_cast<char*>(pool.up->data)   + (target_pos + id) * nbyte_slot_up,     nbyte[0],    table.at(il,id).up.offs);
+        const int32_t s = stage_alloc(true);
+        async_io.block_read(stage_ptr(s, static_cast<int>(submit_type::UP)),   nbyte[0], table.at(il,id).up.offs);
+        async_io.block_read(stage_ptr(s, static_cast<int>(submit_type::GATE)), nbyte[1], table.at(il,id).gate.offs);
+        async_io.block_read(stage_ptr(s, static_cast<int>(submit_type::DOWN)), nbyte[2], table.at(il,id).down.offs);
+        copy_expert_to_pool(il,id,s);
+        stage_release(s);
+        table.mark(il,id,expert_state::InMemory,INVALID_POS);
     }
-    //gate
-    for(int32_t id = 0; id < static_cast<int32_t>(hparams.n_expert); id++){
-        async_io.block_read(static_cast<char*>(pool.gate->data) + (target_pos + id) * nbyte_slot_gate,   nbyte[1],    table.at(il,id).gate.offs);
-    }
-    //down
-    for(int32_t id = 0; id < static_cast<int32_t>(hparams.n_expert); id++){
-        async_io.block_read(static_cast<char*>(pool.down->data) + (target_pos + id) * nbyte_slot_down,   nbyte[2],    table.at(il,id).down.offs);
-    }
-    table.mark_layer(il,expert_state::InMemory,INVALID_POS);
 }
 
 bool custom_moe_unified::can_evict(uint32_t il, int32_t id, uint32_t cur_il){
