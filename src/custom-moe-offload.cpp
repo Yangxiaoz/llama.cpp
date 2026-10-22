@@ -215,8 +215,8 @@ custom_moe_unified::custom_moe_unified(const llama_model & model,const std::stri
     //init the moe_pool
     // the pool is read by the device that runs the expert matmuls, so it lives in device memory. io_uring cannot
     // write device memory: the experts are read into a host staging ring first and then copied into the pool
-    // (copy_expert_to_pool). the iGPU must not read host mapped weights directly: ggml-cuda only handles that on
-    // the MMVQ path (batch <= 8), larger batches are corrupted (feature.md 6.5)
+    // (copy_expert_to_pool). host mapped weights are not an option: ggml-cuda accepts host buffers only for
+    // integrated devices, and upstream disables that because of corrupted output (feature.md 6.5)
     ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
     // model.devices also holds an iGPU (e.g. Jetson), ggml_backend_dev_by_type(GPU) does not find it
     ggml_backend_dev_t dev = model.devices.empty() ? nullptr : model.devices.front().dev;

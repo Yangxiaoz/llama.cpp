@@ -133,7 +133,7 @@ static void batch_set_tokens(llama_batch_ext * batch, const llama_token * tokens
 
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
-    printf("\n    %s -m model.gguf [-n n_predict] [-ngl n_gpu_layers] [-ub n_ubatch] [prompt]\n", argv[0]);
+    printf("\n    %s -m model.gguf [-n n_predict] [-ngl n_gpu_layers] [prompt]\n", argv[0]);
 #ifdef CUSTOM_MOE
     custom_moe_print_usage();
 #endif
@@ -151,8 +151,6 @@ int main(int argc, char ** argv) {
     int ngl = 99;
     // number of tokens to predict
     int n_predict = 32;
-    // maximum number of tokens per ubatch (0 = llama default: n_batch)
-    int n_ubatch = 0;
 #ifdef CUSTOM_MOE
     // custom MoE offload options, filled in by custom_moe_parse_arg() below
     custom_moe_params moe_params;
@@ -185,22 +183,6 @@ int main(int argc, char ** argv) {
                     try {
                         n_predict = std::stoi(argv[++i]);
                     } catch (...) {
-                        print_usage(argc, argv);
-                        return 1;
-                    }
-                } else {
-                    print_usage(argc, argv);
-                    return 1;
-                }
-            } else if (strcmp(argv[i], "-ub") == 0) {
-                if (i + 1 < argc) {
-                    try {
-                        n_ubatch = std::stoi(argv[++i]);
-                    } catch (...) {
-                        print_usage(argc, argv);
-                        return 1;
-                    }
-                    if (n_ubatch < 0) {
                         print_usage(argc, argv);
                         return 1;
                     }
@@ -277,11 +259,6 @@ int main(int argc, char ** argv) {
     ctx_params.n_ctx = n_prompt + n_predict - 1;
     // n_batch is the maximum number of tokens that can be processed in a single call to llama_decode
     ctx_params.n_batch = n_prompt;
-    // maximum number of tokens per ubatch; on Jetson keep it <= 8 so the expert matmuls stay on the
-    // MMVQ path, the only one that works on host-mapped (CUDA_Host) weights (see feature.md 6.5)
-    if (n_ubatch > 0) {
-        ctx_params.n_ubatch = n_ubatch;
-    }
     // enable performance counters
     ctx_params.no_perf = false;
 

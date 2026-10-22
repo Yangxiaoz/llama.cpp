@@ -43,3 +43,8 @@
   - 真正原因: ggml-cuda 的 MMQ 每行按 `MMQ_ITER_K` 分块, 每个专家的**最后一行会读过专家末尾** (最多 `MATRIX_ROW_PADDING` = 512 个值). 上游的连续权重后面是另一个张量, 值有限; 池里混合量化专家后面是 slot 尾部残留字节 (上一个更大专家的数据, fp16 解码常为 NaN), 整槽专家则会读到下一个 slot 的开头 (也可能是别的类型). MMVQ (batch <= 8) 不读这些字节, 所以 `-ub 8` 一直正常.
   - 修复: slot 步长 `nbyte_stride_*` = 最大专家字节 + `nbyte_tail_guard` (1 KB), 且为该部分所有层类型的 `ggml_type_size` 公倍数; 池张量的 `nb[2]` 改用这个步长, buffer 手工分配 (`ggml_backend_buft_alloc_buffer` + `ggml_backend_tensor_alloc`), 拷贝走 I8 视图 `pool_raw[*]` 绕过 `ggml_nbytes` 断言. `copy_expert_to_pool` 每次拷贝前清 staging 的 guard, 并把 guard 一起写进池.
   - 验证: DeepSeek-Lite / Qwen3-30B, CUDA `-ub 8/9/512`, pool 0.1/0.3 全部输出正确; cpu-release / cpu-debug / cuda-moe 三个构建通过. feature.md 4.2 / 6.5 / 不变量 14 同步.
+- 2026-10-22: **审查 9d9e51ef1 之后的两次临时提交, 删除临时参数**:
+  - managed memory 尝试 (639fb6232) 的代码在设备池 + staging (60e631fb8) 中已全部移除: 没有 `GGML_CUDA_ENABLE_UNIFIED_MEMORY` 检查, 没有 managed 分配.
+  - 设备池 + staging **保留**: io_uring 不能写设备内存, 设备池必然需要 staging (或等价的拷贝); 换成 host 池则需要恢复 `integrated = prop.integrated` 补丁和 `get_layer_buft_list` 的 CUSTOM_MOE 分支, 即上游因输出损坏 (#15034) 而关闭的 host-mapped 权重路径 — 和这次修的 MMQ 读过专家末尾是同一类问题. 只有池有 guard 保护, 模型权重没有.
+  - `integrated = false` 和 `get_layer_buft_list` 恢复上游的改动保留: 它们让权重走设备内存, 是当前设备池设计的一部分.
+  - 删除示例里的临时参数 `-ub` (及其 usage 行和 `n_ubatch` 注释); 示例恢复到 9d9e51ef1 的状态.
