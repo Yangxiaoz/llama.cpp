@@ -603,6 +603,13 @@ private:
     size_t                                  nbyte_slot_up;
     size_t                                  nbyte_slot_gate;
     size_t                                  nbyte_slot_down;
+    // slot stride = the largest expert of the part + a zero guard, a multiple of every type size of the part
+    size_t                                  nbyte_stride_up;
+    size_t                                  nbyte_stride_gate;
+    size_t                                  nbyte_stride_down;
+    // I8 views over the pool buffers: the typed pool tensors have a padded nb[2], so the byte copies
+    // go through these to stay inside ggml_nbytes()
+    ggml_tensor *                           pool_raw[NUM_EXPERT] = { nullptr, nullptr, nullptr };
     uint32_t                                n_slots_layer;    // number of slots in one layer
     struct  custom_pool_type                pool_type;
     struct  custom_expert_pool              pool;

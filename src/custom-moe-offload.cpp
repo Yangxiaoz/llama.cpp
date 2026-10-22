@@ -12,7 +12,18 @@
 #include <fstream>
 #include <iostream>
 #include <condition_variable>
+#include <cstring>
+#include <numeric>
 
+
+// ggml-cuda MMQ reads up to MATRIX_ROW_PADDING values past the last row of an expert
+// (mmq.cuh, MATRIX_ROW_PADDING = 512). Upstream tensors are contiguous, so those bytes belong
+// to a neighboring tensor and are finite; a pool slot holds experts of several quantization
+// types, and stale bytes at the slot end (or in the next slot) often decode as NaN. Every slot
+// therefore ends with this many zero bytes (nbyte_stride_*), which the expert copy writes too.
+// MMVQ (batch <= MMVQ_MAX_BATCH_SIZE) does not read past the expert, so the bug shows up only
+// with batch > 8 (feature.md 6.5).
+static constexpr size_t nbyte_tail_guard = 1024;
 
 // #include ""
 std::string extra_copyname(const std::string& str) ;
@@ -184,6 +195,23 @@ custom_moe_unified::custom_moe_unified(const llama_model & model,const std::stri
     //init the table
     table_init(model,ml);
 
+    // ggml-cuda reads up to one K tile past the last row of an expert (MMQ tile loading). the pool
+    // slot therefore ends with a zero guard so that read never lands in the next slot, whose data
+    // may be another quantization type and decode as NaN. the stride has to be a multiple of every
+    // type size of the part, the matmul divides nb[2] by it.
+    const auto slot_stride = [&](int part, ggml_type type_pool, size_t nbyte_slot) {
+        size_t l = ggml_type_size(type_pool);
+        for (uint32_t il = 0; il < moe_layer_count(); il++) {
+            const size_t ts = ggml_type_size(table.layer_type[il][part]);
+            l = l / std::gcd(l, ts) * ts;
+        }
+        const size_t n = nbyte_slot + nbyte_tail_guard;
+        return (n + l - 1) / l * l;
+    };
+    nbyte_stride_up   = slot_stride(0, pool_type.up,   nbyte_slot_up);
+    nbyte_stride_gate = slot_stride(1, pool_type.gate, nbyte_slot_gate);
+    nbyte_stride_down = slot_stride(2, pool_type.down, nbyte_slot_down);
+
     //init the moe_pool
     // the pool is read by the device that runs the expert matmuls, so it lives in device memory. io_uring cannot
     // write device memory: the experts are read into a host staging ring first and then copied into the pool
@@ -214,7 +242,7 @@ custom_moe_unified::custom_moe_unified(const llama_model & model,const std::stri
     ggml_backend_dev_get_props(dev, &props);
 
     //get the number of slots in pool
-    size_t nbyte_group = nbyte_slot_up + nbyte_slot_gate + nbyte_slot_down;
+    size_t nbyte_group = nbyte_stride_up + nbyte_stride_gate + nbyte_stride_down;
     uint64_t n_byte_availa = (uint64_t)(utilization * props.memory_total);
     int32_t n_slots  = n_byte_availa / nbyte_group;
     // prefill keeps whole layers in the pool, so at least one layer must fit
@@ -226,7 +254,7 @@ custom_moe_unified::custom_moe_unified(const llama_model & model,const std::stri
 
 // create a context for  buffer 
     ggml_init_params buffer_params = {
-        /*.mem_size   =*/ size_t(5 *ggml_tensor_overhead()), //up gate down + routers_all, router_biases_all
+        /*.mem_size   =*/ size_t(10 *ggml_tensor_overhead()), //up gate down + their raw copies + routers_all, router_biases_all
         /*.mem_buffer =*/ NULL,
         /*.no_alloc   =*/ true,
     };
@@ -253,6 +281,10 @@ custom_moe_unified::custom_moe_unified(const llama_model & model,const std::stri
     ggml_format_name(ups,   "pool_ups");
     ggml_format_name(gates, "pool_gates");
     ggml_format_name(downs, "pool_downs");
+    // padded slot stride, see slot_stride: ggml_view_3d() and the matmuls take nb[2] from here
+    ups->nb[2]   = nbyte_stride_up;   ups->nb[3]   = nbyte_stride_up   * n_slots;
+    gates->nb[2] = nbyte_stride_gate; gates->nb[3] = nbyte_stride_gate * n_slots;
+    downs->nb[2] = nbyte_stride_down; downs->nb[3] = nbyte_stride_down * n_slots;
     pool = {
         /*tensor_up         =*/ ups,
         /*tensor_gate       =*/ gates,
@@ -273,22 +305,59 @@ custom_moe_unified::custom_moe_unified(const llama_model & model,const std::stri
     }
 
 
-    // allocate tensors and initialize the buffers to avoid NaNs in the padding
-    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, pool_buft);
-    if (!buf) {
-        throw std::runtime_error("failed to allocate buffer for moe_pool");
+    // one buffer per part: the slot stride is padded, so ggml cannot lay the tensors out itself.
+    // the buffers are zeroed: the guard bytes behind the experts and the padding must not decode as NaN
+    size_t nbyte_pool = 0;
+    {
+        ggml_tensor * pool_part[NUM_EXPERT] = { ups, gates, downs };
+        const size_t  stride_part[NUM_EXPERT] = { nbyte_stride_up, nbyte_stride_gate, nbyte_stride_down };
+        for (int part = 0; part < NUM_EXPERT; part++) {
+            const size_t size = (size_t) n_slots * stride_part[part];
+            ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(pool_buft, size);
+            if (!b) {
+                throw std::runtime_error("failed to allocate buffer for moe_pool");
+            }
+            // this is used by ggml_backend_sched to improve op scheduling: ops that use a weight are preferably scheduled to the backend that contains the weight
+            ggml_backend_buffer_set_usage(b, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            void * base = ggml_backend_buffer_get_base(b);
+            if (ggml_backend_tensor_alloc(b, pool_part[part], base) != GGML_STATUS_SUCCESS) {
+                throw std::runtime_error("failed to allocate moe_pool tensor");
+            }
+            ggml_tensor * raw = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, size);
+            ggml_format_name(raw, "pool_raw_%d", part);
+            if (ggml_backend_tensor_alloc(b, raw, base) != GGML_STATUS_SUCCESS) {
+                throw std::runtime_error("failed to allocate moe_pool raw tensor");
+            }
+            pool_raw[part] = raw;
+            if (ggml_backend_buffer_is_host(b)) {
+                memset(base, 0, size);
+            } else {
+                ggml_backend_buffer_clear(b, 0);
+            }
+            bufs.emplace_back(b);
+            nbyte_pool += size;
+        }
     }
-    // this is used by ggml_backend_sched to improve op scheduling: ops that use a weight are preferably scheduled to the backend that contains the weight
-    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-    bufs.emplace_back(buf);
+    if (routers_all != nullptr) {
+        ggml_backend_buffer_t b = ggml_backend_alloc_ctx_tensors_from_buft(ctx, pool_buft);
+        if (!b) {
+            throw std::runtime_error("failed to allocate buffer for moe_pool routers");
+        }
+        ggml_backend_buffer_set_usage(b, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        bufs.emplace_back(b);
+        nbyte_pool += ggml_backend_buffer_get_size(b);
+    }
 
-    // staging ring: one slot per load in flight. n_stage bounds the number of parallel reads
-    nbyte_stage_slot = nbyte_slot_up + nbyte_slot_gate + nbyte_slot_down;
+    // staging ring: one slot per load in flight. n_stage bounds the number of parallel reads.
+    // every part is followed by nbyte_tail_guard zero bytes, see nbyte_tail_guard
+    nbyte_stage_slot = nbyte_slot_up + nbyte_slot_gate + nbyte_slot_down + NUM_EXPERT * nbyte_tail_guard;
     n_stage = 16;
     staging_buf.reset(ggml_backend_buft_alloc_buffer(host_buft, (size_t) n_stage * nbyte_stage_slot));
     if (!staging_buf) {
         throw std::runtime_error("failed to allocate the staging buffer for moe_pool");
     }
+    // the guard bytes behind each part are copied into the pool together with the expert
+    memset(ggml_backend_buffer_get_base(staging_buf.get()), 0, (size_t) n_stage * nbyte_stage_slot);
     stage_free.resize(n_stage);
     for (int32_t s = 0; s < n_stage; s++) {
         stage_free[s] = s;
@@ -305,7 +374,7 @@ custom_moe_unified::custom_moe_unified(const llama_model & model,const std::stri
 
     LLAMA_LOG_INFO("n_slot of pool is:%d \n",n_slots);
     LLAMA_LOG_INFO("%s: %10s moe_expert_pool buffer size = %8.2f MiB, staging %d x %.2f MiB in %s memory\n", __func__,
-        ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0,
+        ggml_backend_buft_name(pool_buft), nbyte_pool/1024.0/1024.0,
         n_stage, nbyte_stage_slot/1024.0/1024.0, ggml_backend_buft_name(host_buft));
 
     // the pre-load layer count is bounded by the model: a larger pool keeps every layer resident
@@ -878,9 +947,9 @@ char * custom_moe_unified::stage_ptr(int32_t s, int part){
     GGML_ASSERT(0 <= s && s < n_stage && 0 <= part && part < NUM_EXPERT);
     size_t off = 0;
     if(part == static_cast<int>(submit_type::GATE)){
-        off = nbyte_slot_up;
+        off = nbyte_slot_up + nbyte_tail_guard;
     } else if(part == static_cast<int>(submit_type::DOWN)){
-        off = nbyte_slot_up + nbyte_slot_gate;
+        off = nbyte_slot_up + nbyte_slot_gate + 2 * nbyte_tail_guard;
     }
     return static_cast<char*>(ggml_backend_buffer_get_base(staging_buf.get())) + (size_t) s * nbyte_stage_slot + off;
 }
@@ -890,9 +959,15 @@ void custom_moe_unified::copy_expert_to_pool(uint32_t il, int32_t id, int32_t s)
     const llama_pos pos = table.at(il,id).pos;
     GGML_ASSERT(pos >= 0);
     const auto & nbyte = table.layer_nbyte[il];
-    ggml_backend_tensor_set(pool.up,   stage_ptr(s, static_cast<int>(submit_type::UP)),   (size_t) pos * nbyte_slot_up,   nbyte[0]);
-    ggml_backend_tensor_set(pool.gate, stage_ptr(s, static_cast<int>(submit_type::GATE)), (size_t) pos * nbyte_slot_gate, nbyte[1]);
-    ggml_backend_tensor_set(pool.down, stage_ptr(s, static_cast<int>(submit_type::DOWN)), (size_t) pos * nbyte_slot_down, nbyte[2]);
+    const size_t stride[NUM_EXPERT] = { nbyte_stride_up, nbyte_stride_gate, nbyte_stride_down };
+    for (int part = 0; part < NUM_EXPERT; part++) {
+        GGML_ASSERT(nbyte[part] + nbyte_tail_guard <= stride[part]);
+        // the staging slot may still hold the tail of a larger expert from an earlier read: clear
+        // the guard here. it is copied into the slot so the matmul reads zeros past the expert.
+        memset(stage_ptr(s, part) + nbyte[part], 0, nbyte_tail_guard);
+        ggml_backend_tensor_set(pool_raw[part], stage_ptr(s, part),
+                                (size_t) pos * stride[part], nbyte[part] + nbyte_tail_guard);
+    }
 }
 
 void custom_moe_unified::load_expert(uint32_t il, int32_t id,llama_pos target_pos,io_mode mode){

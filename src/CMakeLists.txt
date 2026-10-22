@@ -50,11 +50,14 @@ set(LLAMA_CORE_SOURCES
     llama-quant.cpp
     llama-sampler.cpp
     llama-vocab.cpp
-    custom-moe-offload.cpp
-    custom-moe-arpe.cpp
     unicode-data.cpp
     unicode.cpp
 )
+
+# the custom MoE offload sources need CUSTOM_MOE (enum llama_moe_mode and friends in llama.h)
+if (ENABLE_CUSTOM_MOE)
+    list(APPEND LLAMA_CORE_SOURCES custom-moe-offload.cpp custom-moe-arpe.cpp)
+endif()
 
 add_library(llama
             ../include/llama.h

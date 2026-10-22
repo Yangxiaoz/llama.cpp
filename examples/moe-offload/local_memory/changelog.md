@@ -38,3 +38,8 @@
 - 2026-10-21: 定位 Jetson 上的 `!!!!` 输出: CUSTOM_MOE 的 `integrated` 补丁让 iGPU 直接读 CUDA_Host 权重, 而 ggml-cuda 只有 MMVQ (batch <= 8) 能正确读 host 内存. 尝试 managed memory 无效且更慢. 结论写入 6.5. 同期给示例加了临时的 `-ub` 参数作为规避.
 - 2026-10-21: 实现 "设备池 + host staging" (阶段一, 正确性): 池用 `ggml_backend_dev_buffer_type` 放设备内存; 新增 staging 环 (`n_stage = 16`, pinned host), io_uring 写入 staging, `refresh` 的 `on_loaded` 回调把专家拷进池后再标记 `InMemory`; `routers_init` 改用 `ggml_backend_tensor_set`; `get_layer_buft_list` 和 ggml-cuda 的 `integrated` 恢复上游. 第 6 节重写. 阶段二 (异步拷贝) 待正确性验证后做.
 - 2026-10-21: 文档重组: feature.md 只保留特性描述 (设计、数据结构、模式、不变量); 编译运行、测试命令和常见问题移到 `local_memory/build_and_run.md`, 修改记录移到 `local_memory/changelog.md`, 6.5 的定位过程移到 `local_memory/jetson_host_memory.md`; feature.md 第 2 节改为文件索引.
+- 2026-10-21: **定位并修复 CUDA 上 batch > 8 的 `!!!!` (根因不是视图)**:
+  - 最小复现 (`mul_mat_id` + type-patched 视图 + 596 slot 池) 证明视图本身在 4060 上与连续张量逐位一致 (9/29/512 token, 分布 ids).
+  - 真正原因: ggml-cuda 的 MMQ 每行按 `MMQ_ITER_K` 分块, 每个专家的**最后一行会读过专家末尾** (最多 `MATRIX_ROW_PADDING` = 512 个值). 上游的连续权重后面是另一个张量, 值有限; 池里混合量化专家后面是 slot 尾部残留字节 (上一个更大专家的数据, fp16 解码常为 NaN), 整槽专家则会读到下一个 slot 的开头 (也可能是别的类型). MMVQ (batch <= 8) 不读这些字节, 所以 `-ub 8` 一直正常.
+  - 修复: slot 步长 `nbyte_stride_*` = 最大专家字节 + `nbyte_tail_guard` (1 KB), 且为该部分所有层类型的 `ggml_type_size` 公倍数; 池张量的 `nb[2]` 改用这个步长, buffer 手工分配 (`ggml_backend_buft_alloc_buffer` + `ggml_backend_tensor_alloc`), 拷贝走 I8 视图 `pool_raw[*]` 绕过 `ggml_nbytes` 断言. `copy_expert_to_pool` 每次拷贝前清 staging 的 guard, 并把 guard 一起写进池.
+  - 验证: DeepSeek-Lite / Qwen3-30B, CUDA `-ub 8/9/512`, pool 0.1/0.3 全部输出正确; cpu-release / cpu-debug / cuda-moe 三个构建通过. feature.md 4.2 / 6.5 / 不变量 14 同步.

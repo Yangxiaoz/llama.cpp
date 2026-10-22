@@ -69,6 +69,7 @@
 
 - 三个 3D 张量 `pool_ups` / `pool_gates` / `pool_downs`, 形状 `[ne0, ne1, n_slots]`.
 - 一个 "slot" = 一个专家的 up+gate+down. 对 up/gate/down 分别在所有 MoE 层中选**字节数最大**的专家张量作为模板, 池的类型和 `nbyte_slot_*` (`size_t`) 都取自它. 其他层的专家较小时, slot 末尾留空.
+- **slot 步长带尾巴保护**: `nb[2]` (`nbyte_stride_*`) = 最大专家字节数 + `nbyte_tail_guard` (1 KB), 并且是这一部分**所有**层量化类型 `ggml_type_size` 的公倍数 (matmul 用 `nb[2] / type_size` 算专家步长, 必须整除). 每个专家拷进池时, 后面这 1 KB 一起写成 0. 原因见 6.5: ggml-cuda 的 MMQ 会读过专家最后一行, 必须保证读到的字节是有限的. 池张量的 buffer 因此由 `ggml_backend_buft_alloc_buffer` 手工分配, 拷贝走 `pool_raw[*]` (I8 视图), 绕过 `ggml_nbytes` 的边界断言.
 - 专家可以放在任意 slot, 同一层的专家**不需要连续**: `mul_mat_id` 用 slot 下标直接在整个池张量上取专家 (见 5.2).
 - `n_slots = utilization * props.memory_total / nbyte_group`. `props` 来自 `model.devices.front()` (GPU 或 iGPU); 没有设备 (纯 CPU 构建) 时用 CPU device, 即系统内存. `n_slots < n_expert` 时抛异常: 最坏情况下一层的全部专家都会被用到.
 - buffer 类型: 设备的默认 buffer type (`ggml_backend_dev_buffer_type(dev)`), CUDA 下是**设备内存**. buffer usage 设为 `WEIGHTS`. io_uring 不能直接写设备内存, 所以另有一块 host staging 环 (6.1).
@@ -342,7 +343,7 @@ prefill 和 decode 各一份, 模型释放时 (`~custom_moe_unified`) 打印一�
 
 专家池要被 GPU 读取, 而 CPU 要用 io_uring 写入, 两者不能直接共享同一块内存:
 - io_uring 只能写 host 内存.
-- iGPU 直接在 host 内存上计算时, batch > 8 的路径 (MMQ) 会读错 (6.5).
+- iGPU 直接在 host 内存上计算时, batch > 8 的路径 (MMQ) 会读错: 它按自己的规则读过专家末尾, host buffer 里那部分不受我们控制 (6.5).
 
 做法 (设备池 + host staging):
 ```
@@ -378,9 +379,19 @@ SSD --io_uring--> host staging (pinned) --ggml_backend_tensor_set--> 设备池 (
 - 阶段一的同步拷贝会串行化加载线程, 预取的并行度受 `n_stage` 限制.
 - 还没有在板子上验证.
 
-### 6.5 为什么是设备池 + staging
+### 6.5 为什么是设备池 + staging; MMQ 读过专家末尾
 
-旧方案把池放在 CUDA_Host, 让 iGPU 原地读. 在 Jetson 上这条路径只在 batch <= 8 (MMVQ) 时正确, batch > 8 会输出 `!!!!`; managed 内存没有改变这一点, 而且 decode 慢约 35 倍. 所以把池放到设备内存, io_uring 先读进 host staging 再拷进池. 定位过程和实验数据见 [local_memory/jetson_host_memory.md](local_memory/jetson_host_memory.md).
+**根因 (2026-10-21, 在 4060 上定位)**: ggml-cuda 的 MMQ (`mul_mat_q`, batch > `MMVQ_MAX_BATCH_SIZE` = 8) 在每行 K 方向按 `MMQ_ITER_K` 分块读, 最后一块会越过行尾 (最多 `MATRIX_ROW_PADDING` = 512 个值); 对一行的普通行, 越过行尾读到的是下一行, 但**每个专家的最后一行会读过专家末尾**. 上游的正常权重张量是连续存放的, 读到的字节属于下一个张量 (有限值), 再乘上 src1 的零填充, 结果不受影响. 池打破了这两个前提:
+- 混合量化层 (如 Q5_0) 放在 Q8_0 的 slot 里, 专家后面是**空的 slot 尾部**, 里面残留上一个更大专家的字节; 这些字节按 fp16 解码经常是 NaN/inf. MMQ 读到它们, 最后一行输出 NaN, 逐层放大成 `!!!!`.
+- 类型与池一致的层 (整槽专家) 会读过**下一个 slot** 的开头, 那里可能是另一种类型的专家数据, 同样可能解出 NaN.
+
+MMVQ (batch <= 8) 不读这些字节, 所以 `-ub 8` 一直是对的; 用同一个 CUDA 构建、同一个池, 只把 ub 从 8 改成 9 就会复现.
+
+**修复**: 每个 slot 多留 1 KB, 专家拷贝时一起写入 0 (4.2), 这样无论读过专家末尾还是过一个 slot, 读到的都是 0. 顺带发现: staging 槽在不同层之间复用, 只清 guard 不够, 必须**每次拷贝前**清 staging 的 guard, 否则拷进池的是上一个更大专家的尾巴.
+
+**为什么池放设备内存**: 旧方案把池放在 CUDA_Host, 让 iGPU 原地读. 这条路径同样只在 batch <= 8 (MMVQ) 时正确 — host buffer 是上游分配器给的, 我们没法控制专家末尾后面的字节. managed 内存没有改变这一点, 而且 decode 慢约 35 倍. 设备池 + staging 让专家在设备内存里的布局由我们完全控制 (slot 步长和 guard). 定位过程和实验数据见 [local_memory/jetson_host_memory.md](local_memory/jetson_host_memory.md).
+
+**验证**: 独立的 ggml 复现程序 (type-patched 视图 / 池 slot / 污染尾部) 在 4060 上和连续张量逐位一致 (guard 生效时), 污染尾部时出现与模型相同的"每 (token, 专家) 一行 NaN"; 模型上 DeepSeek-Lite 和 Qwen3-30B 在 `-ub 9/512`、pool 0.1/0.3 下都恢复正确输出.
 
 ## 7. 不变量 (排查问题时先检查这些)
 
@@ -395,7 +406,8 @@ SSD --io_uring--> host staging (pinned) --ggml_backend_tensor_set--> 设备池 (
 5. 代码按组件分派, 不按模式分派; 模式到组件的映射只在 `custom_strategy_for` 中.
 6. 自定义算子在 CPU 线程池里执行, **所有线程都会进入**. 新增的状态修改要么只让 `ith == 0` (或 `CallSync` 的初始化函数) 做, 要么加锁.
 7. 池张量在图里的地址固定, 所以图可以被复用. 被固化在算子参数里的 `runtime_ctx` 指针必须在整个模型生命周期内有效.
-8. 池内的字节偏移一律用 `size_t` 计算. 读盘长度 = `layer_nbyte` (<= `nbyte_slot_*`).
+8. 池内的字节偏移一律用 `size_t` 计算. 读盘长度 = `layer_nbyte` (<= `nbyte_slot_*`); 池内偏移用 `nbyte_stride_*`.
+14. 每个 slot 末尾有 `nbyte_tail_guard` (1 KB) 个 0 字节, 拷贝专家时一起写入; `nbyte_stride_*` 必须是该部分所有层类型的 `ggml_type_size` 的公倍数. 破坏这条会让 MMQ (batch > 8) 读出 NaN (6.5).
 9. 异步读只走 `ring`, 只通过 `refresh` 收割; `block_ring` 只用于阻塞读.
 
 ## 8. 未解决的问题
